@@ -1,0 +1,71 @@
+# AI Grand Prix — Master Configuration
+# All tuneable parameters live here. Never hardcode values in source files.
+
+drone:
+  max_speed_mps: 3.0          # Conservative Phase 1 cap (raise in Phase 3)
+  max_accel_mps2: 4.0
+  approach_speed_mps: 1.5     # Speed used when flying toward a detected gate
+  through_speed_mps: 2.5      # Speed maintained passing through gate center
+  recovery_speed_mps: 1.0     # Speed during lost-gate recovery maneuver
+
+perception:
+  camera_fov_deg: 120.0       # Approximate wide-angle FPV FOV
+  image_width: 640
+  image_height: 480
+  gate_min_area_px: 400       # Minimum contour area to count as a gate candidate
+  gate_max_area_px: 180000
+  gate_confidence_threshold: 0.55
+  detection_history_frames: 5 # Frames to hold a gate prediction when lost
+
+  # HSV color range for Round 1 highlighted gates (tune in sim)
+  gate_hsv_lower: [15, 80, 80]
+  gate_hsv_upper: [40, 255, 255]
+
+  # Round 2 / neural detector (YOLO-family, swapped in via config)
+  detector_backend: "classical"   # "classical" | "onnx"
+  onnx_model_path: "perception/models/gate_detector.onnx"
+  onnx_input_size: [640, 640]
+
+state_estimation:
+  ekf_process_noise_pos: 0.01
+  ekf_process_noise_vel: 0.1
+  ekf_measurement_noise_imu: 0.05
+  ekf_measurement_noise_vision: 0.2
+  imu_dt: 0.004               # 250 Hz IMU
+  vision_dt: 0.033             # ~30 Hz camera
+
+planning:
+  gate_approach_distance_m: 1.5   # How far in front of gate to start final alignment
+  waypoint_tolerance_m: 0.3       # Distance at which a waypoint is considered reached
+  lookahead_gates: 2              # How many gates ahead to pre-plan
+  recovery_search_yaw_rate: 30.0  # deg/s yaw sweep when gate is lost
+  recovery_climb_m: 0.3           # Slight altitude gain during recovery
+
+control:
+  # PID gains — position loop (outer)
+  pos_kp: [1.2, 1.2, 1.5]
+  pos_ki: [0.01, 0.01, 0.02]
+  pos_kd: [0.4, 0.4, 0.5]
+
+  # PID gains — velocity loop (inner)
+  vel_kp: [2.0, 2.0, 2.5]
+  vel_ki: [0.05, 0.05, 0.08]
+  vel_kd: [0.1, 0.1, 0.15]
+
+  max_tilt_deg: 35.0
+  max_yaw_rate_dps: 120.0
+  control_hz: 50               # Main control loop frequency
+
+telemetry:
+  log_dir: "logs"
+  log_level: "DEBUG"           # DEBUG | INFO | WARNING
+  flush_interval_s: 1.0
+  max_log_size_mb: 200
+  enable_frame_logging: true   # Save annotated frames alongside flight log
+  frame_log_hz: 10             # Log frames at this rate (subset of camera rate)
+
+sim:
+  host: "127.0.0.1"
+  port: 5760
+  connect_timeout_s: 10.0
+  step_hz: 50                  # How fast we tick the main loop
