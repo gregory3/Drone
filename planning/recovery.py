@@ -83,8 +83,11 @@ class RecoveryBehavior:
         elapsed = now - (self._start_t or now)
 
         if self._state == RecoveryState.YAW_SWEEP:
-            # Hover in place + climb slightly + yaw sweep
-            hover_target = current_pos.copy()
+            # Hover near the last known gate position + climb slightly + yaw sweep
+            if self._last_known_gate_pos is not None:
+                hover_target = self._last_known_gate_pos.copy()
+            else:
+                hover_target = current_pos.copy()
             hover_target[2] += self.ALTITUDE_GAIN_M
 
             # Reverse sweep direction halfway through

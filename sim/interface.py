@@ -89,6 +89,9 @@ class SimInterface(ABC):
     def get_ground_truth(self) -> Optional[DroneState]:
         return None
 
+    def get_course(self) -> Optional[List[np.ndarray]]:
+        return None
+
     def reset(self) -> None:
         pass
 
@@ -200,6 +203,9 @@ class MockSimInterface(SimInterface):
                 vel=self._state.vel.copy(),
                 att_deg=self._state.att_deg.copy(),
             )
+
+    def get_course(self) -> list[np.ndarray]:
+        return self._gates
 
     def reset(self) -> None:
         with self._lock:

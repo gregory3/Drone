@@ -14,6 +14,11 @@ python main.py
 # Run through N gates then stop
 python main.py --gates 3
 
+# Run with live simulator view
+python main.py --gates 3 --view  # press ESC to exit
+
+# If GUI is unavailable, the simulator will record view frames to logs/<run_id>/view.mp4 or logs/<run_id>/view_frames
+
 # Replay last run
 python main.py --replay
 
