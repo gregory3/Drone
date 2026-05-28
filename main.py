@@ -28,7 +28,7 @@ from perception.gate_detector import make_detector
 from state.estimator import DroneStateEstimator
 from control.controller import PIDController
 from planning.recovery import RecoveryBehavior
-from telemetry.logger import FlightLogger, LogFrame
+from telemetry.logger import FlightLogger, LogFrame, export_run_dataset
 
 
 # ---------------------------------------------------------------------------
@@ -45,23 +45,30 @@ PHASE_COMPLETE = "complete"
 class AutonomyLoop:
 
     def __init__(self, mode: str = "mock", run_id: Optional[str] = None,
-                 show_view: bool = False) -> None:
+                 show_view: bool = False, force_ned: bool = False,
+                 use_rerun: bool = False) -> None:
         print("\n" + "="*60)
         print("  AI GRAND PRIX — Autonomy Stack v0.1.0")
         print("="*60)
 
-        self._sim = make_interface(mode=mode)
+        self._sim = make_interface(mode=mode, force_ned=force_ned)
         self._detector = make_detector()
         self._estimator = DroneStateEstimator()
         self._controller = PIDController()
         self._recovery = RecoveryBehavior()
-        self._logger = FlightLogger(run_id=run_id)
+        self._logger = FlightLogger(run_id=run_id, use_rerun=use_rerun)
 
         self._show_view = show_view
         self._viewer: Optional[SimViewer] = None
         self._view_window = "Autonomy Sim View"
         self._stop_requested = False
         self._course = self._sim.get_course() if hasattr(self._sim, "get_course") else None
+        self._use_ground_truth = (mode == "mock" and
+                                  getattr(cfg.sim, "mock_use_ground_truth", True))
+        self._use_course = (mode == "mock" and
+                            getattr(cfg.sim, "mock_use_course", True))
+        if self._course is not None and not self._use_course:
+            self._course = None
 
         self._phase = PHASE_IDLE
         self._current_gate_idx = 0
@@ -69,6 +76,10 @@ class AutonomyLoop:
         self._gate_passed_threshold_m = cfg.planning.waypoint_tolerance_m
         self._loop_hz = cfg.control.control_hz
         self._loop_dt = 1.0 / self._loop_hz
+
+        self._gate_passed_this_cycle = False
+        self._last_detection = None
+        self._detection_age = 0
 
         self._camera_fx = (cfg.perception.image_width / 2) / np.tan(
             np.radians(cfg.perception.camera_fov_deg / 2)
@@ -135,6 +146,8 @@ class AutonomyLoop:
         t0 = time.time()
         t_rel = t0 - (self._start_t or t0)
 
+        self._gate_passed_this_cycle = False
+
         # --- observe ---
         obs = self._sim.get_observation()
 
@@ -146,37 +159,72 @@ class AutonomyLoop:
         )
         state = self._estimator.get_estimate()
 
-        # Mock-only fallback: detect gate passage from course ground truth
-        gt = None
-        if self._course is not None and self._current_gate_idx < len(self._course):
-            gt = self._sim.get_ground_truth()
-            if gt is not None:
-                gate_world = self._course[self._current_gate_idx]
-                if np.linalg.norm(gt.pos - gate_world) < self._gate_passed_threshold_m:
-                    self._on_gate_passed(t_rel)
-                    state = self._estimator.get_estimate()
-
         # Use ground truth in mock mode for control and target computation.
-        if gt is not None:
+        gt = self._sim.get_ground_truth()
+        if self._use_ground_truth and gt is not None:
             state.pos = gt.pos.copy()
             state.vel = gt.vel.copy()
             state.att_deg = gt.att_deg.copy()
 
         # --- perceive ---
+        det_t0 = time.time()
         detections = self._detector.detect(obs.image)
-        gate_detected = bool(detections and
-                             detections[0].confidence >=
-                             cfg.perception.gate_confidence_threshold)
-        best_det = detections[0] if gate_detected else None
+        det_t1 = time.time()
+        detection_latency_ms = (det_t1 - det_t0) * 1000.0
 
-        # EKF vision update
-        if gate_detected and best_det.distance_est_m is not None:
+        gate_detected_actual = bool(detections and
+                                    detections[0].confidence >=
+                                    cfg.perception.gate_confidence_threshold)
+        best_det = detections[0] if gate_detected_actual else None
+
+        if gate_detected_actual:
+            self._last_detection = best_det
+            self._detection_age = 0
+            gate_detected = True
+        elif self._last_detection is not None and \
+                self._detection_age < cfg.perception.detection_history_frames:
+            self._detection_age += 1
+            best_det = self._last_detection
+            gate_detected = True
+        else:
+            self._last_detection = None
+            best_det = None
+            gate_detected = False
+
+        # EKF vision update only on fresh detections
+        if gate_detected_actual and best_det is not None \
+                and best_det.distance_est_m is not None:
             self._estimator.update_from_vision(
                 gate_center_px=best_det.center_px,
                 distance_m=best_det.distance_est_m,
                 frame_w=obs.image.shape[1],
                 frame_h=obs.image.shape[0],
             )
+
+        # --- monitors (for dataset/diagnostics) ---
+        try:
+            import psutil
+            cpu = psutil.cpu_percent(interval=None)
+            mem = psutil.virtual_memory().percent
+        except Exception:
+            cpu = None
+            mem = None
+
+        rpm_mean = float(np.mean(obs.rpm)) if obs.rpm is not None else None
+        battery_pct = getattr(obs, "battery_pct", None)
+        frame_gray = cv2.cvtColor(obs.image, cv2.COLOR_BGR2GRAY)
+        frame_brightness = float(np.mean(frame_gray))
+
+        monitors = {
+            "rpm_mean": rpm_mean,
+            "battery_pct": battery_pct,
+            "detection_latency_ms": float(detection_latency_ms),
+            "detection_count": len(detections) if detections is not None else 0,
+            "detection_confidence": float(best_det.confidence) if best_det is not None else 0.0,
+            "frame_brightness": frame_brightness,
+            "cpu_percent": cpu,
+            "mem_percent": mem,
+        }
 
         # --- compute target position ---
         target_pos, yaw_rate_override = self._compute_target(
@@ -188,10 +236,19 @@ class AutonomyLoop:
 
         # --- control ---
         confidence = best_det.confidence if gate_detected else 0.3
+        max_speed = cfg.drone.max_speed_mps
+        if self._phase == PHASE_APPROACH:
+            max_speed = cfg.drone.approach_speed_mps
+        elif self._phase == PHASE_THROUGH:
+            max_speed = cfg.drone.through_speed_mps
+        elif self._phase == PHASE_RECOVERY:
+            max_speed = cfg.drone.recovery_speed_mps
+
         ctrl = self._controller.compute(
             current_pos=state.pos,
             target_pos=target_pos,
             confidence=confidence,
+            max_speed=max_speed,
         )
         if yaw_rate_override is not None:
             ctrl.yaw_rate = yaw_rate_override
@@ -204,17 +261,26 @@ class AutonomyLoop:
         if gate_detected and best_det.distance_est_m is not None:
             if best_det.distance_est_m < self._gate_passed_threshold_m:
                 self._on_gate_passed(t_rel)
+                self._gate_passed_this_cycle = True
 
-        if self._last_gate_pos is not None and self._phase in {PHASE_APPROACH, PHASE_THROUGH}:
+        if not self._gate_passed_this_cycle and self._last_gate_pos is not None \
+                and self._phase in {PHASE_APPROACH, PHASE_THROUGH}:
             if np.linalg.norm(state.pos - self._last_gate_pos) < self._gate_passed_threshold_m:
                 self._on_gate_passed(t_rel)
+                self._gate_passed_this_cycle = True
 
-        if self._course is not None and self._current_gate_idx < len(self._course):
-            gt = self._sim.get_ground_truth()
-            if gt is not None:
-                gate_world = self._course[self._current_gate_idx]
-                if np.linalg.norm(gt.pos - gate_world) < self._gate_passed_threshold_m:
-                    self._on_gate_passed(t_rel)
+        if not self._gate_passed_this_cycle and self._course is not None \
+                and self._current_gate_idx < len(self._course):
+            if self._gate_passed_by_plane(state.pos, self._course[self._current_gate_idx]):
+                self._on_gate_passed(t_rel)
+                self._gate_passed_this_cycle = True
+
+        if not self._gate_passed_this_cycle and self._course is not None \
+                and self._current_gate_idx < len(self._course) and gt is not None:
+            gate_world = self._course[self._current_gate_idx]
+            if np.linalg.norm(gt.pos - gate_world) < self._gate_passed_threshold_m:
+                self._on_gate_passed(t_rel)
+                self._gate_passed_this_cycle = True
 
         # --- log ---
         loop_dt_ms = (time.time() - t0) * 1000
@@ -237,6 +303,7 @@ class AutonomyLoop:
             confidence_score=confidence,
             phase=self._phase,
             loop_dt_ms=loop_dt_ms,
+            monitors=monitors,
         ))
 
         self._loop_count += 1
@@ -261,8 +328,20 @@ class AutonomyLoop:
         """Determine where to fly this cycle. Returns (target_pos, yaw_rate_override)."""
 
         # --- recovery check ---
+        if self._phase == PHASE_THROUGH and self._last_gate_pos is not None:
+            # If the gate was recently visible, continue to the through target
+            # using the last known gate position rather than switching to recovery.
+            if self._course is not None and self._current_gate_idx < len(self._course):
+                gate_world = self._course[self._current_gate_idx]
+                direction = self._course_direction(state.pos, gate_world)
+                through_target = gate_world + direction * cfg.planning.gate_through_offset_m
+                return through_target, None
+            return self._last_gate_pos.copy(), None
+
+        confidence = best_det.confidence if best_det is not None else 0.0
         phase_out, recovery_target, recovery_yaw = self._recovery.update(
             gate_detected=gate_detected,
+            gate_confidence=confidence,
             current_pos=state.pos,
             last_gate_pos=self._last_gate_pos,
         )
@@ -271,30 +350,45 @@ class AutonomyLoop:
             return recovery_target, recovery_yaw
 
         # --- normal flight ---
-        if gate_detected and best_det.distance_est_m is not None:
-            # Compute gate world position from image and distance
-            d = best_det.distance_est_m
-            u, v = best_det.center_px
-            cam_x = (u - self._camera_cx) * d / self._camera_fx
-            cam_y = (v - self._camera_cy) * d / self._camera_fy
-            yaw_rad = np.radians(state.att_deg[2])
-            rel_x = np.cos(yaw_rad) * d - np.sin(yaw_rad) * cam_x
-            rel_y = np.sin(yaw_rad) * d + np.cos(yaw_rad) * cam_x
-            rel_z = -cam_y
-            gate_center = state.pos + np.array([rel_x, rel_y, rel_z])
-            self._last_gate_pos = gate_center.copy()
+        if gate_detected:
+            gate_target = None
+            if self._course is not None and self._current_gate_idx < len(self._course):
+                gate_world = self._course[self._current_gate_idx]
+                self._last_gate_pos = gate_world.copy()
+                direction = self._course_direction(state.pos, gate_world)
+                approach_target = gate_world - direction * cfg.planning.gate_approach_distance_m
+                through_target = gate_world + direction * cfg.planning.gate_through_offset_m
+                distance_to_gate = np.linalg.norm(gate_world - state.pos)
 
-            # Aim to a point slightly before the gate until we're close enough
-            if d > cfg.planning.gate_approach_distance_m:
-                alpha = max((d - cfg.planning.gate_approach_distance_m) / d, 0.1)
-                target_rel = (gate_center - state.pos) * alpha
-                self._phase = PHASE_APPROACH
-            else:
-                target_rel = gate_center - state.pos
-                self._phase = PHASE_THROUGH
+                if distance_to_gate > cfg.planning.gate_approach_distance_m + 0.1:
+                    gate_target = approach_target
+                    self._phase = PHASE_APPROACH
+                else:
+                    gate_target = through_target
+                    self._phase = PHASE_THROUGH
+            elif best_det.distance_est_m is not None:
+                # Fall back to vision-based reprojection when no course is available.
+                d = best_det.distance_est_m
+                u, v = best_det.center_px
+                cam_x = (u - self._camera_cx) * d / self._camera_fx
+                cam_y = (v - self._camera_cy) * d / self._camera_fy
+                yaw_rad = np.radians(state.att_deg[2])
+                rel_x = np.cos(yaw_rad) * d - np.sin(yaw_rad) * cam_x
+                rel_y = np.sin(yaw_rad) * d + np.cos(yaw_rad) * cam_x
+                rel_z = -cam_y
+                gate_center = state.pos + np.array([rel_x, rel_y, rel_z])
+                self._last_gate_pos = gate_center.copy()
 
-            gate_target = state.pos + target_rel
-            return gate_target, None
+                if d > cfg.planning.gate_approach_distance_m:
+                    alpha = max((d - cfg.planning.gate_approach_distance_m) / d, 0.1)
+                    gate_target = state.pos + (gate_center - state.pos) * alpha
+                    self._phase = PHASE_APPROACH
+                else:
+                    gate_target = gate_center
+                    self._phase = PHASE_THROUGH
+
+            if gate_target is not None:
+                return gate_target, None
 
         # No gate — search: hold position and yaw slowly.
         # In mock mode, use the next course gate as a fallback target.
@@ -337,9 +431,45 @@ class AutonomyLoop:
         print(f"  [Gate {self._current_gate_idx + 1}] PASSED ✓  "
               f"(t={t:.2f}s, total={self._gates_passed})")
         self._current_gate_idx += 1
+
+        if self._course is not None and self._current_gate_idx >= len(self._course):
+            self._phase = PHASE_COMPLETE
+            self._logger.event(t, "flight_complete",
+                               total_passed=self._gates_passed)
+            print(f"  [Main] Course complete. {self._gates_passed} gates passed.")
+            return
+
         self._last_gate_pos = None
         self._recovery.reset()
         self._controller.reset()
+
+    def _course_direction(self, state_pos: np.ndarray, gate_world: np.ndarray) -> np.ndarray:
+        if self._course is None or len(self._course) == 0:
+            return np.array([1.0, 0.0, 0.0])
+
+        if self._current_gate_idx > 0:
+            # Use the incoming path from the prior gate to define gate plane and
+            # through direction. This is the actual approach vector for the
+            # current gate.
+            direction = gate_world - self._course[self._current_gate_idx - 1]
+        elif self._current_gate_idx + 1 < len(self._course):
+            direction = self._course[self._current_gate_idx + 1] - gate_world
+        else:
+            direction = gate_world - state_pos
+
+        norm = np.linalg.norm(direction)
+        if norm < 1e-3:
+            return np.array([1.0, 0.0, 0.0])
+        return direction / norm
+
+    def _gate_passed_by_plane(self, state_pos: np.ndarray, gate_world: np.ndarray) -> bool:
+        if self._course is None or len(self._course) == 0:
+            return False
+
+        direction = self._course_direction(state_pos, gate_world)
+        rel = state_pos - gate_world
+        signed_dist = float(np.dot(rel, direction))
+        return signed_dist > cfg.planning.gate_pass_plane_dist_m
 
     # ------------------------------------------------------------------
     def _print_summary(self) -> None:
@@ -362,14 +492,32 @@ def main():
     parser = argparse.ArgumentParser(description="AI Grand Prix autonomy stack")
     parser.add_argument("--mode", default="mock", choices=["mock", "real"],
                         help="Simulation mode")
+    parser.add_argument("--realistic", action="store_true",
+                        help="In mock mode, disable ground truth state injection")
+    parser.add_argument("--blind", action="store_true",
+                        help="In mock mode, ignore mock course positions and use vision only")
     parser.add_argument("--run-id", default=None, help="Custom run identifier")
     parser.add_argument("--gates", type=int, default=None,
                         help="Stop after N gates (default: run until complete)")
     parser.add_argument("--view", action="store_true",
                         help="Show mock simulator camera view")
+    parser.add_argument("--export", metavar="RUN_ID", default=None,
+                        help="Export a completed run's dataset and exit")
+    parser.add_argument("--export-out", default=None,
+                        help="Output directory for exported dataset")
+    parser.add_argument("--force-ned", action="store_true",
+                        help="Wrap sim interface to present NED frame to stack")
+    parser.add_argument("--rerun", action="store_true",
+                        help="Stream telemetry to Rerun (requires rerun-sdk installed)")
     parser.add_argument("--replay", action="store_true",
                         help="Replay last run instead of flying")
     args = parser.parse_args()
+
+    if args.export is not None:
+        out_dir = args.export_out
+        exported = export_run_dataset(args.export, out_dir)
+        print(f"Exported run {args.export} to {exported}")
+        return
 
     if args.replay:
         from telemetry.replay import FlightReplay
@@ -383,8 +531,14 @@ def main():
         replay.plot_confidence()
         return
 
+    if args.realistic and args.mode == "mock":
+        cfg.sim.mock_use_ground_truth = False
+    if args.blind and args.mode == "mock":
+        cfg.sim.mock_use_course = False
+
     loop = AutonomyLoop(mode=args.mode, run_id=args.run_id,
-                         show_view=args.view)
+                         show_view=args.view, force_ned=args.force_ned,
+                         use_rerun=args.rerun)
     loop.run(max_gates=args.gates)
 
 

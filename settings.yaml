@@ -16,6 +16,9 @@ perception:
   gate_max_area_px: 180000
   gate_confidence_threshold: 0.55
   detection_history_frames: 5 # Frames to hold a gate prediction when lost
+  temporal_smoothing_frames: 4 # Smooth gate detections across recent frames
+  temporal_smoothing_miss_tolerance: 2 # Keep last smoothed detection for short dropouts
+  detection_max_center_jump_px: 120 # Reject inconsistent detections from history
 
   # HSV color range for Round 1 highlighted gates (tune in sim)
   gate_hsv_lower: [15, 80, 80]
@@ -36,10 +39,13 @@ state_estimation:
 
 planning:
   gate_approach_distance_m: 1.5   # How far in front of gate to start final alignment
+  gate_through_offset_m: 0.8      # How far past the gate center to target for a clean pass
+  gate_pass_plane_dist_m: 0.2     # Signed distance beyond gate plane to count as passed
   waypoint_tolerance_m: 0.3       # Distance at which a waypoint is considered reached
   lookahead_gates: 2              # How many gates ahead to pre-plan
   recovery_search_yaw_rate: 30.0  # deg/s yaw sweep when gate is lost
   recovery_climb_m: 0.3           # Slight altitude gain during recovery
+  recovery_resume_confirm_frames: 2  # Frames of stable detection required to exit recovery
 
 control:
   # PID gains — position loop (outer)
@@ -69,3 +75,5 @@ sim:
   port: 5760
   connect_timeout_s: 10.0
   step_hz: 50                  # How fast we tick the main loop
+  mock_use_course: true         # Use the mock course positions when in mock mode
+  mock_use_ground_truth: true  # When true, mock sim uses perfect ground truth for state

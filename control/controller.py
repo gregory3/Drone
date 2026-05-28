@@ -12,7 +12,7 @@ Output: (vx, vy, vz, yaw_rate) in world frame.
 from __future__ import annotations
 import time
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -50,10 +50,12 @@ class PIDController:
     def compute(self,
                 current_pos: np.ndarray,
                 target_pos: np.ndarray,
-                confidence: float = 1.0) -> ControlOutput:
+                confidence: float = 1.0,
+                max_speed: Optional[float] = None) -> ControlOutput:
         """
         Compute velocity command to drive drone from current_pos toward target_pos.
         confidence ∈ [0,1] scales max speed (low confidence → slow down).
+        max_speed can override the configured top speed for phase-based control.
         """
         now = time.time()
         dt = now - self._last_t
@@ -63,6 +65,8 @@ class PIDController:
 
         error = target_pos - current_pos
         distance = np.linalg.norm(error)
+        if distance < 0.05:
+            return ControlOutput(0.0, 0.0, 0.0, 0.0, confidence)
 
         # Integrate (with windup guard)
         self._integral += error * dt
@@ -78,9 +82,10 @@ class PIDController:
                    + self._kd * derivative)
 
         # Speed limit: scale by confidence (lower confidence → slower)
-        speed_limit = self._max_speed * np.clip(confidence, 0.2, 1.0)
+        speed_limit = self._max_speed if max_speed is None else min(self._max_speed, max_speed)
+        speed_limit *= np.clip(confidence, 0.2, 1.0)
         speed = np.linalg.norm(raw_cmd)
-        if speed > speed_limit:
+        if speed > speed_limit and speed > 0:
             raw_cmd = raw_cmd / speed * speed_limit
 
         # Yaw toward gate: simple proportional to lateral error

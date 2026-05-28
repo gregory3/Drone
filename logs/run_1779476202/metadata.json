@@ -1,8 +1,0 @@
-{
-  "run_id": "run_1779476202",
-  "wall_start": 1779476202.3054323,
-  "wall_duration_s": 43.701,
-  "frame_count": 2131,
-  "avg_hz": 48.8,
-  "log_file": "logs\\run_1779476202\\flight.ndjson"
-}

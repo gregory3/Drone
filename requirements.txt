@@ -4,3 +4,4 @@ filterpy
 pytest
 matplotlib
 pyyaml
+rerun-sdk

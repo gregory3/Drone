@@ -44,9 +44,12 @@ class RecoveryBehavior:
         self._sweep_dir = 1.0   # +1 or -1 yaw direction
         self._frames_without_gate = 0
         self._trigger_frames = cfg.perception.detection_history_frames
+        self._resume_confirm_frames = 0
+        self._required_resume_confirm = cfg.planning.recovery_resume_confirm_frames
 
     # ------------------------------------------------------------------
     def update(self, gate_detected: bool,
+               gate_confidence: float,
                current_pos: np.ndarray,
                last_gate_pos: Optional[np.ndarray]) -> Tuple[str, np.ndarray, float]:
         """
@@ -59,11 +62,20 @@ class RecoveryBehavior:
         """
         if gate_detected:
             self._frames_without_gate = 0
-            if self._state != RecoveryState.IDLE:
+            self._resume_confirm_frames += 1
+            if self._state == RecoveryState.IDLE:
+                self._resume_confirm_frames = 0
+                return ("resume", current_pos, 0.0)
+
+            if self._resume_confirm_frames >= self._required_resume_confirm:
                 self._state = RecoveryState.IDLE
                 self._start_t = None
-            return ("resume", current_pos, 0.0)
+                self._resume_confirm_frames = 0
+                return ("resume", current_pos, 0.0)
 
+            return ("recovery", current_pos, 0.0)
+
+        self._resume_confirm_frames = 0
         self._frames_without_gate += 1
 
         # Haven't lost it long enough to trigger recovery
@@ -137,3 +149,4 @@ class RecoveryBehavior:
         self._start_t = None
         self._frames_without_gate = 0
         self._last_known_gate_pos = None
+        self._resume_confirm_frames = 0

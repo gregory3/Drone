@@ -20,8 +20,10 @@ Usage:
 from __future__ import annotations
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+import os
 
 import cv2
 import numpy as np
@@ -163,8 +165,21 @@ class ONNXGateDetector(GateDetector):
     """
 
     def __init__(self) -> None:
-        import onnxruntime as ort
         model_path = cfg.perception.onnx_model_path
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(
+                f"ONNX model not found at {model_path!r}. "
+                "Place a YOLO gate detector at this path or switch to "
+                "detector_backend='classical' in settings.yaml."
+            )
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise ImportError(
+                "onnxruntime is required for the ONNX detector backend. "
+                "Install it with `pip install onnxruntime`."
+            ) from exc
+
         self._input_size = tuple(cfg.perception.onnx_input_size)  # (W, H)
         self._conf_thresh = cfg.perception.gate_confidence_threshold
 
@@ -211,15 +226,94 @@ class ONNXGateDetector(GateDetector):
 
 
 # ---------------------------------------------------------------------------
+# Temporal smoothing wrapper
+# ---------------------------------------------------------------------------
+
+class TemporalGateDetector(GateDetector):
+    def __init__(self, backend: GateDetector,
+                 history_frames: int,
+                 max_missed_frames: int,
+                 max_center_jump_px: float) -> None:
+        self._backend = backend
+        self._history_frames = max(1, history_frames)
+        self._max_missed_frames = max(0, max_missed_frames)
+        self._max_center_jump_px = max_center_jump_px
+        self._history = deque(maxlen=self._history_frames)
+        self._missed_frames = 0
+        self._smoothed: Optional[GateDetection] = None
+
+    def detect(self, frame_bgr: np.ndarray) -> List[GateDetection]:
+        raw = self._backend.detect(frame_bgr)
+        if raw:
+            best = raw[0]
+            if self._smoothed is None or self._is_consistent(best):
+                self._history.append(best)
+            else:
+                self._history.clear()
+                self._history.append(best)
+            self._missed_frames = 0
+            self._smoothed = self._compute_smoothed()
+            return [self._smoothed]
+
+        if self._history and self._missed_frames < self._max_missed_frames:
+            self._missed_frames += 1
+            return [self._smoothed] if self._smoothed is not None else []
+
+        self._history.clear()
+        self._smoothed = None
+        return []
+
+    def _is_consistent(self, detection: GateDetection) -> bool:
+        if self._smoothed is None:
+            return True
+        dx = detection.center_px[0] - self._smoothed.center_px[0]
+        dy = detection.center_px[1] - self._smoothed.center_px[1]
+        return np.hypot(dx, dy) <= self._max_center_jump_px
+
+    def _compute_smoothed(self) -> GateDetection:
+        centers = np.array([det.center_px for det in self._history], dtype=float)
+        bboxes = np.array([det.bbox_px for det in self._history], dtype=float)
+        confidences = np.array([det.confidence for det in self._history], dtype=float)
+        areas = np.array([det.area_px for det in self._history], dtype=float)
+        distances = np.array([
+            det.distance_est_m for det in self._history
+            if det.distance_est_m is not None
+        ], dtype=float)
+
+        center = tuple(np.mean(centers, axis=0).tolist())
+        bbox = tuple(np.round(np.mean(bboxes, axis=0)).astype(int).tolist())
+        confidence = float(np.mean(confidences))
+        area = float(np.mean(areas))
+        distance_est_m = float(np.mean(distances)) if distances.size else None
+
+        return GateDetection(
+            center_px=center,
+            bbox_px=bbox,
+            area_px=area,
+            confidence=confidence,
+            distance_est_m=distance_est_m,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 def make_detector(backend: Optional[str] = None) -> GateDetector:
     b = backend or cfg.perception.detector_backend
     if b == "classical":
-        return ClassicalGateDetector()
+        detector = ClassicalGateDetector()
     elif b == "onnx":
-        return ONNXGateDetector()
+        detector = ONNXGateDetector()
     else:
         raise ValueError(f"Unknown detector backend: {b!r}. "
                          f"Use 'classical' or 'onnx'.")
+
+    if getattr(cfg.perception, "temporal_smoothing_frames", 0) > 0:
+        detector = TemporalGateDetector(
+            backend=detector,
+            history_frames=cfg.perception.temporal_smoothing_frames,
+            max_missed_frames=cfg.perception.temporal_smoothing_miss_tolerance,
+            max_center_jump_px=cfg.perception.detection_max_center_jump_px,
+        )
+    return detector
