@@ -1,0 +1,30 @@
+# Flight logs — can be GB in size; never commit them.
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.venv/
+.venv*/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.so
+*.dylib
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS noise
+.DS_Store
+Thumbs.db
