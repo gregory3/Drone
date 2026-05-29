@@ -1,5 +1,5 @@
 """
-sim.interface
+drone_sim.interface
 Abstraction layer for the DCL simulator API.
 
 Real SDK:
@@ -11,7 +11,7 @@ Mock (now):
     perception and control pipelines before the official SDK arrives.
 
 Usage:
-    from sim.interface import make_interface
+    from drone_sim.interface import make_interface
     sim = make_interface(mode="mock")   # or "real"
     sim.connect()
 
@@ -124,8 +124,19 @@ class MockSimInterface(SimInterface):
     GATE_SIZE_M = 1.2   # square gate, side length
 
     def __init__(self,
-                 image_size: Tuple[int, int] = (640, 480),
-                 gates: Optional[List[np.ndarray]] = None) -> None:
+                 image_size: Optional[Tuple[int, int]] = None,
+                 gates: Optional[List[np.ndarray]] = None,
+                 fov_deg: Optional[float] = None,
+                 tilt_deg: Optional[float] = None) -> None:
+        from config.loader import cfg as _cfg
+        p = _cfg.perception
+        if image_size is None:
+            image_size = (p.image_width, p.image_height)
+        if fov_deg is None:
+            fov_deg = p.camera_fov_deg
+        if tilt_deg is None:
+            tilt_deg = getattr(p, "camera_tilt_deg", 0.0)
+
         self._W, self._H = image_size
         self._gates = gates or self.DEFAULT_GATES
         self._state = DroneState(
@@ -139,12 +150,12 @@ class MockSimInterface(SimInterface):
         self._connected = False
         self._lock = threading.Lock()
 
-        # Intrinsics for a 120° HFOV camera
-        fov_rad = np.radians(120.0)
+        fov_rad = np.radians(fov_deg)
         self._fx = (self._W / 2) / np.tan(fov_rad / 2)
         self._fy = self._fx
         self._cx = self._W / 2
         self._cy = self._H / 2
+        self._tilt_rad = np.radians(tilt_deg)
 
     # ------------------------------------------------------------------
     def connect(self) -> None:
@@ -230,14 +241,23 @@ class MockSimInterface(SimInterface):
             drone_pos = self._state.pos.copy()
             yaw = np.radians(self._state.att_deg[2])
 
-        # Rotation matrix: world → camera frame (yaw only)
+        # Rotation matrix: world -> camera frame.
         # Camera convention: X=right, Y=down, Z=forward (into scene)
-        # World forward (X) → camera Z; world left (Y) → camera -X; world up (Z) → camera -Y
-        R = np.array([
-            [-np.sin(yaw),  np.cos(yaw), 0],   # cam X = world lateral
-            [           0,            0,-1],    # cam Y = world down
-            [ np.cos(yaw),  np.sin(yaw), 0],   # cam Z = world forward
+        # Step 1: yaw (around world Z) aligns drone heading with camera forward.
+        # Step 2: apply +tilt about the camera X axis so the lens looks "up"
+        #         relative to the body forward vector (matches Elodin rig spec).
+        R_yaw = np.array([
+            [-np.sin(yaw),  np.cos(yaw), 0],
+            [           0,            0,-1],
+            [ np.cos(yaw),  np.sin(yaw), 0],
         ])
+        t = self._tilt_rad
+        R_tilt = np.array([
+            [1.0,         0.0,          0.0],
+            [0.0,  np.cos(t),    np.sin(t)],
+            [0.0, -np.sin(t),    np.cos(t)],
+        ])
+        R = R_tilt @ R_yaw
 
         for i, gate_world in enumerate(self._gates):
             rel = gate_world - drone_pos
@@ -293,26 +313,17 @@ def make_interface(mode: str = "mock", **kwargs) -> SimInterface:
     force_ned = kwargs.pop("force_ned", False)
     if mode == "mock":
         base = MockSimInterface(**kwargs)
-        if force_ned:
-            return NEDAdapter(base, underlying_frame="enu")
-        return base
     elif mode == "real":
-        # Swap in RealSimInterface once the DCL SDK is available
         base = RealSimInterface(**kwargs)
-        if force_ned:
-            return NEDAdapter(base, underlying_frame="enu")
-        return base
     elif mode == "elodin":
-        # Adapter for the open-source Elodin practice rig. If the
-        # Elodin SDK/package isn't installed, the interface is still
-        # importable but `connect()` will raise so callers can detect
-        # that the runtime dependency is missing.
         base = ElodinSimInterface(**kwargs)
-        if force_ned:
-            return NEDAdapter(base, underlying_frame="enu")
-        return base
     else:
-        raise ValueError(f"Unknown sim mode: {mode!r}. Use 'mock' or 'real'.")
+        raise ValueError(
+            f"Unknown sim mode: {mode!r}. Use 'mock', 'real', or 'elodin'."
+        )
+    if force_ned:
+        return NEDAdapter(base, underlying_frame="enu")
+    return base
 
 
 class RealSimInterface(SimInterface):
@@ -351,194 +362,277 @@ class RealSimInterface(SimInterface):
 
 
 class ElodinSimInterface(SimInterface):
-    """Adapter stub for the Elodin practice rig.
+    """Adapter for the open-source Elodin AI Grand Prix practice rig.
 
-    This class is importable when the codebase is loaded. At runtime the
-    `connect()` method will attempt to import the Elodin SDK (or related
-    package) and raise a clear error if it's not available. The real
-    implementation should wrap the Elodin client to produce `Observation`
-    records compatible with the rest of the stack and ensure the NED
-    coordinate frame is preserved.
+    The Elodin rig runs Betaflight SITL + 6-DOF physics and asks the solver
+    to implement a single callback:
+
+        def autopilot(update: SensorUpdate) -> RCCommand
+
+    This adapter inverts that callback so the rest of the stack can keep
+    using the polling `get_observation()` / `send_velocity_command()` shape.
+    Each call to `get_observation()` blocks until the next `SensorUpdate`
+    arrives from the rig; `send_velocity_command()` is bridged through a
+    `velocity_to_rc` translator (see `control.velocity_to_rc`) and the
+    resulting `RCCommand` is returned the next time the rig invokes our
+    autopilot.
+
+    SDK availability:
+      - The `elodin` PyPI package is macOS / glibc >= 2.35 Linux only.
+        On Windows the rig must be run inside WSL. The adapter itself is
+        portable; only `connect()` requires the runtime SDK.
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 15000,
-                 connect_timeout_s: float = 10.0) -> None:
-        self.host = host
-        self.port = port
-        self.connect_timeout_s = connect_timeout_s
-        self._client = None
+    def __init__(self, sim_main_module: Optional[str] = None,
+                 control_hz: float = 50.0,
+                 frame_timeout_s: float = 1.0,
+                 synchronous: bool = False) -> None:
+        """sim_main_module: when set, `connect()` launches a worker thread
+        running the rig's `sim/main.py` (production path).
+        synchronous: when True, skip the inter-thread queues entirely.
+            push_sensor_update/get_observation work via `_last_update` and
+            send_velocity_command/pop_command via `_last_rc`. Use this for
+            solver-bridge mode where one callback invocation = one tick.
+        """
+        self._sim_main_module = sim_main_module
+        self._control_hz = control_hz
+        self._frame_timeout_s = frame_timeout_s
+        self._synchronous = synchronous
         self._connected = False
+        self._last_update: Optional["SensorUpdate"] = None  # type: ignore[name-defined]
+        self._last_rc = None
+        self._cmd_vel = np.zeros(3)
+        self._cmd_yaw_rate = 0.0
+        self._velocity_to_rc = None  # lazy-imported to avoid circulars
+        self._update_queue = None
+        self._command_queue = None
+        self._sim_thread = None
 
+    # ---------------------------------------------------------------- runtime
     def connect(self) -> None:
         try:
-            # Try to import the Elodin SDK (name may vary depending on the
-            # upstream package). The adapter uses a thin translation layer
-            # so the rest of the stack sees `Observation` / `IMUReading`.
-            import elodin  # type: ignore
+            import elodin  # type: ignore  # noqa: F401
         except Exception as exc:
             raise NotImplementedError(
-                "ElodinSimInterface requires the Elodin SDK package. "
-                "Install it or run in 'mock' mode. Original import error: %s" % exc
+                "ElodinSimInterface requires the `elodin` SDK package "
+                "(macOS or glibc >= 2.35 Linux; on Windows install inside WSL). "
+                f"Install it with `pip install -U elodin`. Import error: {exc}"
             )
 
-        # Create client and open streams. The exact API will depend on the
-        # installed Elodin package; try common methods and raise helpful
-        # errors if they are not present so integrators know what to adapt.
-        try:
-            self._client = elodin.Client(host=self.host, port=self.port)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to construct Elodin client: {exc}")
+        from control.velocity_to_rc import VelocityToRC
+        self._velocity_to_rc = VelocityToRC()
 
-        # Try to enable streaming modes commonly exposed by sim clients.
-        try:
-            if hasattr(self._client, "open_streams"):
-                self._client.open_streams()
-            elif hasattr(self._client, "start"):
-                self._client.start()
-        except Exception:
-            # Not fatal; many toy SDKs don't require explicit start.
-            pass
+        if not self._synchronous:
+            import queue
+            self._update_queue = queue.Queue(maxsize=8)
+            self._command_queue = queue.Queue(maxsize=8)
+
+        if self._sim_main_module is not None:
+            self._launch_sim_thread(self._sim_main_module)
 
         self._connected = True
 
-    def get_observation(self) -> Observation:
-        if not self._connected or self._client is None:
-            raise RuntimeError("Elodin client not connected")
+    def _launch_sim_thread(self, module_name: str) -> None:
+        """Import the rig's `sim/main.py` in a worker thread and feed it the
+        adapter's autopilot callback. The Elodin runtime calls the callback
+        every physics tick; the callback drains a single (update, rc) pair
+        through the queues exposed by `get_observation` /
+        `send_velocity_command`.
+        """
+        import importlib
+        import threading
 
-        # Many sim SDKs provide a single call that returns the latest
-        # timestep as a dict-like object. Allow multiple candidate method
-        # names so this adapter is tolerant to the upstream API.
-        frame = None
-        for method in ("get_frame", "recv_frame", "pop_frame", "read_frame"):
-            if hasattr(self._client, method):
-                frame = getattr(self._client, method)()
-                break
+        def _autopilot_callback(update):
+            try:
+                self._update_queue.put(update, timeout=self._frame_timeout_s)
+            except Exception:
+                pass
+            try:
+                rc = self._command_queue.get(timeout=self._frame_timeout_s)
+            except Exception:
+                from .competition_types import RCCommand
+                rc = RCCommand()  # safe defaults (disarmed, throttle 1000)
+            return rc
 
-        if frame is None:
-            # As a last resort, try a `poll()` that may return (ok, data)
-            if hasattr(self._client, "poll"):
-                try:
-                    ok, frame = self._client.poll(timeout=0.1)
-                    if not ok:
-                        raise RuntimeError("No frame available from Elodin client")
-                except Exception as exc:
-                    raise RuntimeError(f"Failed to read frame from Elodin client: {exc}")
+        def _runner():
+            mod = importlib.import_module(module_name)
+            if hasattr(mod, "run"):
+                mod.run(autopilot=_autopilot_callback)
+            elif hasattr(mod, "main"):
+                mod.main(_autopilot_callback)
             else:
-                raise NotImplementedError(
-                    "Elodin client does not expose known frame retrieval methods."
+                raise RuntimeError(
+                    f"Elodin sim module {module_name!r} does not expose "
+                    "`run(autopilot=...)` or `main(autopilot)`."
                 )
 
-        # Expect frame to be a mapping with keys: 'image', 'imu', 'rpm', 'timestamp'
-        try:
-            img = frame.get("image") if isinstance(frame, dict) else None
-        except Exception:
-            img = None
+        self._sim_thread = threading.Thread(
+            target=_runner, name="elodin-sim", daemon=True
+        )
+        self._sim_thread.start()
 
-        # Convert image to numpy BGR if needed
-        if img is None:
-            raise RuntimeError("Elodin frame did not contain 'image' field")
-
-        import numpy as _np
-        # Some SDKs return RGB; check dtype and shape and convert when needed.
-        image = _np.array(img)
-        if image.ndim == 3 and image.shape[2] == 3:
-            # Heuristic: if image appears to be RGB, try converting by checking
-            # whether values look like normalized floats or 0..255 ints. We
-            # assume upstream supplies uint8; if it's not BGR convert RGB->BGR.
+    # ---------------------------------------------------------------- inbound
+    def push_sensor_update(self, update) -> None:
+        """Test/integration hook: inject a SensorUpdate manually (used when
+        the Elodin rig is driven from the same process rather than a thread).
+        """
+        self._last_update = update
+        if self._update_queue is not None:
             try:
-                # If the SDK documents a field, use it; otherwise assume RGB and
-                # convert to BGR for OpenCV compatibility.
-                image = image[..., ::-1].copy()  # RGB -> BGR
+                self._update_queue.put_nowait(update)
             except Exception:
                 pass
 
-        # IMU mapping: accept either dict or object with attributes
-        imu_src = frame.get("imu") if isinstance(frame, dict) else None
-        if imu_src is None:
-            raise RuntimeError("Elodin frame missing imu data")
-
-        # Normalize IMU values
+    def pop_command(self):
+        """Test/integration hook: pull the next RCCommand the adapter wants
+        to issue. Returns a zero command if none queued.
+        """
+        from .competition_types import RCCommand
+        if self._command_queue is None:
+            return self._last_rc or RCCommand(0.0, 0.0, 0.0, 0.0)
         try:
-            ax, ay, az = imu_src.get("accel")
-            gx, gy, gz = imu_src.get("gyro")
-            ts = frame.get("timestamp", frame.get("time", None))
+            return self._command_queue.get_nowait()
         except Exception:
-            # Try attribute access
-            ax, ay, az = imu_src.accel
-            gx, gy, gz = imu_src.gyro
-            ts = getattr(frame, "timestamp", None)
+            return self._last_rc or RCCommand(0.0, 0.0, 0.0, 0.0)
 
-        # Upstream Elodin rig follows NED by spec; expose the IMU as-is.
-        imu = IMUReading(accel=(float(ax), float(ay), float(az)),
-                         gyro=(float(gx), float(gy), float(gz)),
-                         timestamp=float(ts) if ts is not None else time.time())
+    # ---------------------------------------------------------------- API
+    def get_observation(self) -> Observation:
+        if not self._connected:
+            raise RuntimeError("ElodinSimInterface not connected")
 
-        # RPM telemetry optional
-        rpm = frame.get("rpm") or frame.get("motors") or [0.0, 0.0, 0.0, 0.0]
+        update = self._last_update
+        if self._update_queue is not None:
+            try:
+                update = self._update_queue.get(timeout=self._frame_timeout_s)
+                self._last_update = update
+            except Exception:
+                if update is None:
+                    raise RuntimeError(
+                        "Timed out waiting for SensorUpdate from Elodin rig"
+                    )
 
-        timestamp = frame.get("timestamp") or frame.get("time") or time.time()
-
-        return Observation(image=image, imu=imu, rpm=rpm, timestamp=float(timestamp))
+        return self._to_observation(update)
 
     def send_velocity_command(self,
                                vx: float, vy: float, vz: float,
                                yaw_rate: float = 0.0) -> None:
-        if not self._connected or self._client is None:
-            raise RuntimeError("Elodin client not connected")
+        if not self._connected:
+            raise RuntimeError("ElodinSimInterface not connected")
 
-        # Most sim flight APIs accept a velocity or setpoint command. Try
-        # a few common method names. Commands are expected in NED (north,
-        # east, down). If the upstream client expects different axes, the
-        # integrator should adapt here.
-        cmd = {
-            "vx": float(vx),
-            "vy": float(vy),
-            "vz": float(vz),
-            "yaw_rate": float(yaw_rate),
-        }
+        self._cmd_vel = np.array([vx, vy, vz])
+        self._cmd_yaw_rate = float(yaw_rate)
 
-        for method in ("send_velocity", "set_velocity", "send_command"):
-            if hasattr(self._client, method):
-                try:
-                    getattr(self._client, method)(cmd)
-                    return
-                except TypeError:
-                    # maybe method expects separate args
-                    try:
-                        getattr(self._client, method)(vx, vy, vz, yaw_rate)
-                        return
-                    except Exception:
-                        continue
+        # Extract yaw + altitude + vz from the latest SensorUpdate so the
+        # translator can do takeoff hand-off and altitude clamping cleanly.
+        # Use raw indexing so this works against both our SensorUpdate and
+        # the upstream rig's solver.api.SensorUpdate (which lacks our
+        # convenience properties).
+        yaw_rad = None
+        altitude_m = None
+        vz_actual = None
+        u = self._last_update
+        if u is not None:
+            wp = np.asarray(u.world_pos, dtype=float)
+            wv = np.asarray(u.world_vel, dtype=float)
+            qx, qy, qz, qw = wp[0], wp[1], wp[2], wp[3]
+            yaw_rad = float(np.arctan2(
+                2.0 * (qw * qz + qx * qy),
+                1.0 - 2.0 * (qy * qy + qz * qz),
+            ))
+            altitude_m = float(wp[6])
+            if wv.size >= 6:
+                vz_actual = float(wv[5])
 
-        # Fallback: if client exposes a generic command interface
-        if hasattr(self._client, "command"):
+        rc = self._velocity_to_rc.convert(
+            vx=vx, vy=vy, vz=vz, yaw_rate_dps=yaw_rate,
+            yaw_rad=yaw_rad,
+            altitude_m=altitude_m,
+            vertical_velocity_mps=vz_actual,
+        )
+        self._last_rc = rc
+        if self._command_queue is not None:
             try:
-                self._client.command("velocity", **cmd)
-                return
+                if self._command_queue.full():
+                    try:
+                        self._command_queue.get_nowait()
+                    except Exception:
+                        pass
+                self._command_queue.put_nowait(rc)
             except Exception:
                 pass
-
-        raise NotImplementedError(
-            "ElodinSimInterface could not find a supported command method on the client."
-        )
 
     def disconnect(self) -> None:
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:
-                pass
         self._connected = False
+        # Worker thread is daemon — exits with the process.
 
     def reset(self) -> None:
-        # Optional: instruct the Elodin rig to reset
-        try:
-            if hasattr(self._client, "reset"):
-                self._client.reset()
-            elif hasattr(self._client, "home"):
-                self._client.home()
-        except Exception:
-            pass
+        self._cmd_vel = np.zeros(3)
+        self._cmd_yaw_rate = 0.0
+        self._last_update = None
+        self._last_rc = None
+
+    def get_ground_truth(self) -> Optional[DroneState]:
+        u = self._last_update
+        if u is None:
+            return None
+        # Use raw layout (`world_pos = [qx, qy, qz, qw, x, y, z]`,
+        # `world_vel = [wx, wy, wz, vx, vy, vz]`) so this works against
+        # both our `drone_sim.competition_types.SensorUpdate` and the
+        # upstream Elodin `solver.api.SensorUpdate` (which doesn't carry
+        # our convenience properties).
+        wp = np.asarray(u.world_pos, dtype=float)
+        wv = np.asarray(u.world_vel, dtype=float)
+        pos = wp[4:7].copy()
+        vel = wv[3:6].copy() if wv.size >= 6 else np.zeros(3)
+        qx, qy, qz, qw = wp[0], wp[1], wp[2], wp[3]
+        roll  = np.degrees(np.arctan2(2 * (qw * qx + qy * qz),
+                                       1 - 2 * (qx * qx + qy * qy)))
+        sinp  = 2 * (qw * qy - qz * qx)
+        pitch = np.degrees(np.arcsin(np.clip(sinp, -1.0, 1.0)))
+        yaw   = np.degrees(np.arctan2(2 * (qw * qz + qx * qy),
+                                       1 - 2 * (qy * qy + qz * qz)))
+        return DroneState(
+            pos=pos,
+            vel=vel,
+            att_deg=np.array([roll, pitch, yaw], dtype=float),
+        )
+
+    # ---------------------------------------------------------------- helpers
+    @staticmethod
+    def _to_observation(update) -> Observation:
+        if update is None:
+            raise RuntimeError("No SensorUpdate available yet")
+        imu = IMUReading(
+            accel=tuple(np.asarray(update.accel, dtype=float).tolist()),
+            gyro=tuple(np.asarray(update.gyro, dtype=float).tolist()),
+            timestamp=update.t,
+        )
+
+        frame = update.frame_rgba
+        if frame is None:
+            # No fresh camera this tick - synthesize a black BGR frame so
+            # the perception pipeline can run without crashing. The detector
+            # will simply return no detections.
+            from .competition_types import CameraSpec
+            image = np.zeros((CameraSpec.HEIGHT_PX, CameraSpec.WIDTH_PX, 3),
+                             dtype=np.uint8)
+        else:
+            # SensorUpdate.frame_rgba is RGBA uint8; drop alpha + flip to BGR
+            # so the rest of the stack (OpenCV-based) can consume it.
+            arr = np.asarray(frame)
+            if arr.ndim == 3 and arr.shape[2] == 4:
+                image = arr[..., [2, 1, 0]].copy()  # RGBA -> BGR
+            elif arr.ndim == 3 and arr.shape[2] == 3:
+                image = arr[..., ::-1].copy()       # RGB  -> BGR
+            else:
+                image = arr.copy()
+
+        return Observation(
+            image=image,
+            imu=imu,
+            rpm=[0.0, 0.0, 0.0, 0.0],
+            timestamp=update.t,
+        )
 
 
 class NEDAdapter(SimInterface):

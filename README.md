@@ -9,40 +9,103 @@ Software-only autonomous drone racing for the [AI Grand Prix](https://www.theaig
 python -m pip install --user -r requirements.txt
 
 # Run mock simulation (no hardware needed)
-python main.py
+python drone_main.py
 
 # Run through N gates then stop
-python main.py --gates 3
+python drone_main.py --gates 3
 
 # Run with live simulator view
-python main.py --gates 3 --view  # press ESC to exit
+python drone_main.py --gates 3 --view  # press ESC to exit
 
 # To test the perception + estimator pipeline without perfect ground truth:
-python main.py --gates 3 --view --realistic
+python drone_main.py --gates 3 --view --realistic
 
 # To test the mock sim in a blind mode that ignores gate world coordinates:
-python main.py --gates 3 --view --realistic --blind
+python drone_main.py --gates 3 --view --realistic --blind
 
 # If GUI is unavailable, the simulator will record view frames to logs/<run_id>/view.mp4 or logs/<run_id>/view_frames
 
 # Run in real simulator mode (placeholder stub until SDK integration)
-python main.py --mode real
+python drone_main.py --mode real
 
 # Use the Elodin practice rig (Betaflight SITL + rolling-shutter camera)
-To run using the Elodin practice rig adapter (when the Elodin SDK is installed):
 
-```bash
-# Start the Elodin server/simulator separately (see Elodin docs)
-python main.py --mode elodin --gates 3 --view --force-ned
+`ElodinSimInterface` in `sim/interface.py` adapts the rig's
+`autopilot(SensorUpdate) -> RCCommand` callback into the polling
+`SimInterface` shape the rest of the stack uses.
+
+### Install the rig
+
+The `elodin` SDK supports **macOS** and **glibc >= 2.35 Linux** only. Pick
+the path that matches your host:
+
+**Windows (current host):**
+```powershell
+# One-time: enable WSL with Ubuntu 22.04+
+wsl --install -d Ubuntu-22.04
+# Then inside WSL:
+git clone https://github.com/elodin-sys/ai-grand-prix
+cd ai-grand-prix
+bash scripts/install_elodin.sh
+uv venv --python 3.13 && source .venv/bin/activate && uv sync
+git submodule update --init --recursive --depth 1 betaflight
+bash scripts/build_betaflight.sh
 ```
 
+**macOS (future host):**
+```bash
+git clone https://github.com/elodin-sys/ai-grand-prix
+cd ai-grand-prix
+bash scripts/install_elodin.sh
+uv venv --python 3.13 && source .venv/bin/activate && uv sync
+git submodule update --init --recursive --depth 1 betaflight
+bash scripts/build_betaflight.sh
+```
+
+### Run our stack as the rig's solver
+
+The rig invokes a Python module named by the `RACE_SOLVER` env var as its
+autopilot. Our bridge module at [drone_sim/elodin_solver.py](drone_sim/elodin_solver.py)
+exposes `autopilot(SensorUpdate) -> RCCommand` and re-uses the same
+`AutonomyLoop` we test against the mock.
+
+One-time inside the rig's venv (WSL `~/ai-grand-prix`):
+
+```bash
+source .venv/bin/activate
+uv pip install filterpy matplotlib pyyaml rerun-sdk
+```
+
+Then run, pointing at our Drone project on `/mnt/c/...`:
+
+```bash
+cd ~/ai-grand-prix && source .venv/bin/activate
+PYTHONPATH="/mnt/c/Users/<You>/G/Drone" \
+DRONE_PROJECT_ROOT="/mnt/c/Users/<You>/G/Drone" \
+RACE_SOLVER=drone_sim.elodin_solver \
+elodin run sim/main.py
+```
+
+Tunables exposed to the bridge:
+- `DRONE_CONTROL_HZ` (default `50`) — heavy-tick rate. The rig calls
+    `autopilot()` at 1000 Hz; we run our perception/EKF/controller on
+    1/N of those ticks and cache the resulting `RCCommand`.
+- `DRONE_LOG_DIR` (default `~/drone_solver_logs`) — where the
+    `FlightLogger` writes NDJSON. Keep it in WSL-native filesystem;
+    writing to `/mnt/c` via 9P costs ~10 ms per write.
+- `RACE_RUN_ID` (default `elodin_smoke`) — name of the run.
+
 Notes:
-- The code exposes `ElodinSimInterface` in `sim/interface.py`. If the Elodin
-    Python package is not installed, `ElodinSimInterface.connect()` will raise a
-    helpful `NotImplementedError` explaining what's missing.
-- The runtime flag `--force-ned` (or `make_interface(mode='elodin', force_ned=True)`)
-    wraps the underlying sim with a frame adapter that converts ENU->NED so the
-    rest of the stack runs in the competition NED frame.
+- The Python code is OS-agnostic — everything except the `elodin`
+    runtime install runs natively on Windows.
+- `--force-ned` wraps the adapter so the stack sees NED instead of the
+    rig's native ENU. Leave it off until the official DCL sim publishes a
+    confirmed frame convention.
+- The bridge mirrors the rig's arming sequence verbatim: throttle 1000 /
+    arm 1000 for t < 0.5 s, then arm transitions to 1800 with throttle
+    still at 1000 until t = 0.75 s, then the autonomy loop takes over.
+    Betaflight refuses to arm if throttle is non-minimum during the
+    transition.
 
 ## Rerun telemetry (optional)
 
@@ -56,17 +119,17 @@ pip install rerun-sdk
 Then enable streaming when running the stack:
 
 ```bash
-python main.py --gates 3 --rerun
+python drone_main.py --gates 3 --rerun
 ```
 
 The system will continue writing NDJSON logs locally; Rerun is an additional
 best-effort streaming sink for quicker debugging and collaboration.
 
 # Replay last run
-python main.py --replay
+python drone_main.py --replay
 
 # Export a completed run for dataset analysis
-python main.py --export <run_id>
+python drone_main.py --export <run_id>
 
 # Analyze an exported run
 python -m telemetry.analyze logs/<run_id>
@@ -111,7 +174,7 @@ python -m pytest tests/ -v
 
 1. **Make a change** to any module
 2. **Run** `python -m pytest test_stack.py -v` — must stay green
-3. **Fly** `python main.py --gates 5`
+3. **Fly** `python drone_main.py --gates 5`
 4. **Replay** `python -m telemetry.replay logs/<last_run> --plot`
 5. Look at the confidence + phase plot and understand *why* something failed
 6. Fix the right thing

@@ -81,18 +81,20 @@ def test_replay_summary(tmp_path, monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 
 def test_mock_sim_connects_and_observes():
-    from sim.interface import MockSimInterface
+    from drone_sim.interface import MockSimInterface
+    from config.loader import cfg
     sim = MockSimInterface()
     sim.connect()
     obs = sim.get_observation()
-    assert obs.image.shape == (480, 640, 3)
+    assert obs.image.shape == (cfg.perception.image_height,
+                              cfg.perception.image_width, 3)
     assert len(obs.rpm) == 4
     assert obs.imu.timestamp > 0
     sim.disconnect()
 
 
 def test_mock_sim_moves_on_command():
-    from sim.interface import MockSimInterface
+    from drone_sim.interface import MockSimInterface
     sim = MockSimInterface()
     sim.connect()
     sim.reset()
@@ -108,7 +110,7 @@ def test_mock_sim_moves_on_command():
 
 
 def test_mock_sim_renders_gates():
-    from sim.interface import MockSimInterface
+    from drone_sim.interface import MockSimInterface
     import cv2
     sim = MockSimInterface()
     sim.connect()
@@ -122,7 +124,7 @@ def test_mock_sim_renders_gates():
 
 
 def test_make_interface_real_mode_stub():
-    from sim.interface import make_interface, RealSimInterface
+    from drone_sim.interface import make_interface, RealSimInterface
     sim = make_interface(mode="real")
     assert isinstance(sim, RealSimInterface)
     with pytest.raises(NotImplementedError):
@@ -130,11 +132,86 @@ def test_make_interface_real_mode_stub():
 
 
 def test_make_interface_elodin_raises_when_sdk_missing():
-    from sim.interface import make_interface, ElodinSimInterface
+    from drone_sim.interface import make_interface, ElodinSimInterface
     sim = make_interface(mode="elodin")
     assert isinstance(sim, ElodinSimInterface)
     with pytest.raises(NotImplementedError):
         sim.connect()
+
+
+def test_elodin_adapter_round_trips_sensor_update(monkeypatch):
+    """Drive the adapter without the SDK: push a SensorUpdate, pop the
+    resulting RCCommand. Exercises the queue-based callback bridge."""
+    import sys, types
+    fake_elodin = types.ModuleType("elodin")
+    monkeypatch.setitem(sys.modules, "elodin", fake_elodin)
+
+    from drone_sim.interface import ElodinSimInterface
+    from drone_sim.competition_types import SensorUpdate
+
+    adapter = ElodinSimInterface()
+    adapter.connect()
+
+    # world_pos = [qx, qy, qz, qw, x, y, z]  (level attitude => qw=1)
+    # world_vel = [wx, wy, wz, vx, vy, vz]
+    update = SensorUpdate(
+        t=0.0, tick=0,
+        world_pos=np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.5]),
+        world_vel=np.zeros(6),
+        gyro=np.zeros(3),
+        accel=np.array([0.0, 0.0, -9.81]),
+        frame_rgba=np.zeros((360, 640, 4), dtype=np.uint8),
+        frame_fresh=True,
+    )
+    adapter.push_sensor_update(update)
+    obs = adapter.get_observation()
+    assert obs.image.shape == (360, 640, 3), "frame_rgba must be reduced to BGR"
+    assert obs.imu.accel == (0.0, 0.0, -9.81)
+
+    adapter.send_velocity_command(vx=2.0, vy=0.0, vz=0.0, yaw_rate=10.0)
+    rc = adapter.pop_command()
+    # PWM ints in [1000, 2000]. The rig's Betaflight tune uses
+    # pitch > 1500 to accelerate forward (matches baseline solver), so a
+    # +vx command should push pitch above center.
+    assert 1000 <= rc.pitch <= 2000
+    assert 1000 <= rc.roll  <= 2000
+    assert 1000 <= rc.throttle <= 2000
+    assert rc.pitch > 1500, "Forward velocity -> pitch stick above center"
+    assert rc.arm >= 1700, "Adapter should arm motors when commanding velocity"
+
+
+def test_velocity_to_rc_clamps_and_directions():
+    from control.velocity_to_rc import VelocityToRC
+
+    v = VelocityToRC()
+    # Pure forward velocity (vx>0): pitch stick above center (1500).
+    rc = v.convert(vx=1.0, vy=0.0, vz=0.0, altitude_m=2.0)
+    assert rc.pitch > 1500
+    assert rc.roll == 1500
+
+    # Pure world-east velocity while facing north (yaw=90 deg) ->
+    # becomes forward in body frame -> pitch above center.
+    rc = v.convert(vx=0.0, vy=1.0, vz=0.0, yaw_rad=math_pi_half(),
+                   altitude_m=2.0)
+    assert rc.pitch > 1500
+
+    # Below 1 m altitude -> takeoff throttle handoff.
+    rc = v.convert(vx=0.0, vy=0.0, vz=0.5, altitude_m=0.5)
+    from drone_sim.competition_types import RC_TAKEOFF_THROTTLE
+    assert rc.throttle == RC_TAKEOFF_THROTTLE
+
+    # Huge command -> still clamped into Betaflight PWM range.
+    rc = v.convert(vx=100.0, vy=100.0, vz=100.0, yaw_rate_dps=10000.0,
+                   altitude_m=5.0)
+    assert 1000 <= rc.roll  <= 2000
+    assert 1000 <= rc.pitch <= 2000
+    assert 1000 <= rc.yaw   <= 2000
+    assert 1000 <= rc.throttle <= 2000
+
+
+def math_pi_half():
+    import math
+    return math.pi / 2
 
 
 def test_export_run_dataset_creates_csv_and_events(tmp_path, monkeypatch):
@@ -321,18 +398,37 @@ def test_estimator_returns_healthy_initial():
     assert state.vel.shape == (3,)
 
 
-def test_estimator_tracks_commanded_velocity():
+def test_estimator_integrates_imu_acceleration():
+    """With body accel of 5 m/s^2 forward (plus gravity hold) the EKF
+    should report a positive forward velocity after a few ticks."""
     from state.estimator import DroneStateEstimator
     est = DroneStateEstimator()
-    est.set_command_velocity(np.array([2.0, 0.0, 0.0]))
 
     t = time.time()
-    for i in range(10):
-        est.predict((0, 0, -9.81), (0, 0, 0), t + i * 0.02)
+    # First call only seeds _last_t; second call onwards integrates.
+    est.predict((0.0, 0.0, -9.81), (0, 0, 0), t)
+    for i in range(1, 20):
+        est.predict((5.0, 0.0, -9.81), (0, 0, 0), t + i * 0.02)
 
     state = est.get_estimate()
-    # Position should have moved in x
-    assert state.pos[0] > 0.1
+    assert state.vel[0] > 0.1, f"Expected forward velocity, got {state.vel[0]}"
+    assert state.pos[0] > 0.0, f"Expected forward position, got {state.pos[0]}"
+
+
+def test_estimator_holds_still_under_gravity_only():
+    """Stationary drone (only gravity on the accelerometer) must not drift."""
+    from state.estimator import DroneStateEstimator
+    est = DroneStateEstimator()
+
+    t = time.time()
+    est.predict((0.0, 0.0, -9.81), (0, 0, 0), t)
+    for i in range(1, 100):
+        est.predict((0.0, 0.0, -9.81), (0, 0, 0), t + i * 0.02)
+
+    state = est.get_estimate()
+    assert abs(state.vel[0]) < 1e-6
+    assert abs(state.vel[1]) < 1e-6
+    assert abs(state.vel[2]) < 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +536,7 @@ def test_recovery_requires_stable_detection_to_resume():
 
 
 def test_autonomy_loop_completes_when_last_gate_passed():
-    from main import AutonomyLoop, PHASE_COMPLETE
+    from drone_main import AutonomyLoop, PHASE_COMPLETE
 
     loop = AutonomyLoop(mode="mock", run_id="test_complete", show_view=False)
     assert loop._course is not None
@@ -454,7 +550,7 @@ def test_autonomy_loop_completes_when_last_gate_passed():
 
 
 def test_autonomy_loop_uses_course_gate_when_visible():
-    from main import AutonomyLoop
+    from drone_main import AutonomyLoop
 
     loop = AutonomyLoop(mode="mock", run_id="test_course_target", show_view=False)
     assert loop._course is not None
@@ -476,7 +572,7 @@ def test_autonomy_loop_uses_course_gate_when_visible():
 
 
 def test_autonomy_loop_aims_past_gate_when_close():
-    from main import AutonomyLoop
+    from drone_main import AutonomyLoop
     from config.loader import cfg
 
     loop = AutonomyLoop(mode="mock", run_id="test_close_target", show_view=False)
@@ -499,7 +595,7 @@ def test_autonomy_loop_aims_past_gate_when_close():
 
 
 def test_autonomy_loop_transitions_to_through_at_approach_boundary():
-    from main import AutonomyLoop
+    from drone_main import AutonomyLoop
 
     loop = AutonomyLoop(mode="mock", run_id="test_approach_boundary", show_view=False)
     assert loop._course is not None
@@ -523,7 +619,7 @@ def test_autonomy_loop_transitions_to_through_at_approach_boundary():
 
 def test_autonomy_loop_can_disable_mock_ground_truth(monkeypatch):
     import config.loader as loader
-    from main import AutonomyLoop
+    from drone_main import AutonomyLoop
 
     monkeypatch.setattr(loader.cfg.sim, "mock_use_ground_truth", False)
     loop = AutonomyLoop(mode="mock", run_id="test_realistic", show_view=False)
@@ -532,7 +628,7 @@ def test_autonomy_loop_can_disable_mock_ground_truth(monkeypatch):
 
 def test_autonomy_loop_can_disable_mock_course(monkeypatch):
     import config.loader as loader
-    from main import AutonomyLoop
+    from drone_main import AutonomyLoop
 
     monkeypatch.setattr(loader.cfg.sim, "mock_use_course", False)
     loop = AutonomyLoop(mode="mock", run_id="test_blind", show_view=False)
@@ -541,7 +637,7 @@ def test_autonomy_loop_can_disable_mock_course(monkeypatch):
 
 
 def test_autonomy_loop_persists_last_detection_short_loss(monkeypatch):
-    from main import AutonomyLoop
+    from drone_main import AutonomyLoop
     from perception.gate_detector import GateDetection
     import numpy as np
 
@@ -577,7 +673,7 @@ def test_autonomy_loop_persists_last_detection_short_loss(monkeypatch):
 
 
 def test_course_direction_prefers_previous_gate_path():
-    from main import AutonomyLoop
+    from drone_main import AutonomyLoop
 
     loop = AutonomyLoop(mode="mock", run_id="test_direction_path", show_view=False)
     assert loop._course is not None
@@ -597,7 +693,7 @@ def test_course_direction_prefers_previous_gate_path():
 
 def test_full_control_cycle():
     """Smoke test: run one tick through all modules without crashing."""
-    from sim.interface import MockSimInterface
+    from drone_sim.interface import MockSimInterface
     from perception.gate_detector import ClassicalGateDetector
     from state.estimator import DroneStateEstimator
     from control.controller import PIDController

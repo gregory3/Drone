@@ -15,6 +15,14 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Force UTF-8 stdout/stderr so the Unicode arrows and check marks used in
+# log lines don't crash a default Windows cp1252 console.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import cv2
 import numpy as np
 
@@ -22,8 +30,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config.loader import cfg
-from sim.interface import make_interface
-from sim.viewer import SimViewer
+from drone_sim.interface import make_interface
+from drone_sim.viewer import SimViewer
 from perception.gate_detector import make_detector
 from state.estimator import DroneStateEstimator
 from control.controller import PIDController
@@ -46,12 +54,16 @@ class AutonomyLoop:
 
     def __init__(self, mode: str = "mock", run_id: Optional[str] = None,
                  show_view: bool = False, force_ned: bool = False,
-                 use_rerun: bool = False) -> None:
+                 use_rerun: bool = False,
+                 elodin_sim_module: Optional[str] = None) -> None:
         print("\n" + "="*60)
         print("  AI GRAND PRIX — Autonomy Stack v0.1.0")
         print("="*60)
 
-        self._sim = make_interface(mode=mode, force_ned=force_ned)
+        sim_kwargs = {}
+        if mode == "elodin" and elodin_sim_module is not None:
+            sim_kwargs["sim_main_module"] = elodin_sim_module
+        self._sim = make_interface(mode=mode, force_ned=force_ned, **sim_kwargs)
         self._detector = make_detector()
         self._estimator = DroneStateEstimator()
         self._controller = PIDController()
@@ -490,8 +502,12 @@ class AutonomyLoop:
 
 def main():
     parser = argparse.ArgumentParser(description="AI Grand Prix autonomy stack")
-    parser.add_argument("--mode", default="mock", choices=["mock", "real"],
+    parser.add_argument("--mode", default="mock",
+                        choices=["mock", "real", "elodin"],
                         help="Simulation mode")
+    parser.add_argument("--elodin-sim-module", default=None,
+                        help="Importable Python module for the Elodin rig's "
+                             "sim/main.py (e.g. 'sim.main')")
     parser.add_argument("--realistic", action="store_true",
                         help="In mock mode, disable ground truth state injection")
     parser.add_argument("--blind", action="store_true",
@@ -538,7 +554,8 @@ def main():
 
     loop = AutonomyLoop(mode=args.mode, run_id=args.run_id,
                          show_view=args.view, force_ned=args.force_ned,
-                         use_rerun=args.rerun)
+                         use_rerun=args.rerun,
+                         elodin_sim_module=args.elodin_sim_module)
     loop.run(max_gates=args.gates)
 
 

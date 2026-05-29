@@ -81,7 +81,18 @@ class DroneStateEstimator:
 
     # ------------------------------------------------------------------
     def predict(self, accel: Tuple, gyro: Tuple, timestamp: float) -> None:
-        """IMU prediction step — call at IMU rate (~250 Hz in real, each obs in mock)."""
+        """IMU prediction step — call at IMU rate (~250 Hz in real, each obs in mock).
+
+        The accelerometer reports specific force in the body frame including
+        gravity. We rotate it into the world frame using the current attitude
+        estimate, subtract gravity, and integrate the residual into velocity.
+        The constant-velocity state-transition then propagates position.
+
+        `set_command_velocity` no longer overrides the velocity state; that
+        was only valid in mock where commanded == actual. On the real rig
+        (and the Elodin practice rig) commanded velocity is what the outer
+        loop *wants*, not what the drone is doing.
+        """
         if self._last_t is None:
             self._last_t = timestamp
             return
@@ -92,24 +103,42 @@ class DroneStateEstimator:
             return
         self._last_t = timestamp
 
-        # Update F for this dt
+        # Integrate attitude from gyro first so accel rotation uses the
+        # freshest estimate available.
+        g = np.array(gyro) - self._gyro_bias
+        self._att_deg += np.degrees(g) * dt
+
+        # State transition: constant-velocity prior over dt
         self._kf.F = np.eye(self.DIM_X)
         self._kf.F[0, 3] = dt
         self._kf.F[1, 4] = dt
         self._kf.F[2, 5] = dt
-
-        # Control input: commanded velocity drives the velocity state
-        # (in real system we'd use IMU; in Phase 1 mock, commanded vel is reliable)
-        u = self._cmd_vel.copy()
-        self._kf.x[3, 0] = u[0]
-        self._kf.x[4, 0] = u[1]
-        self._kf.x[5, 0] = u[2]
-
         self._kf.predict()
 
-        # Integrate attitude from gyro
-        g = np.array(gyro) - self._gyro_bias
-        self._att_deg += np.degrees(g) * dt
+        # Body -> world rotation, then strip gravity. The mock and Elodin
+        # rigs both use a Z-up convention, so gravity is (0, 0, -g).
+        accel_world = self._body_to_world(np.array(accel, dtype=float))
+        accel_world[2] += 9.81  # subtract gravity (accel reads -g while at rest)
+        # Integrate into velocity. Clamp to avoid numerical blowups during
+        # the first few ticks when attitude is still uncertain.
+        delta_v = np.clip(accel_world * dt, -5.0, 5.0)
+        self._kf.x[3, 0] += float(delta_v[0])
+        self._kf.x[4, 0] += float(delta_v[1])
+        self._kf.x[5, 0] += float(delta_v[2])
+
+    def _body_to_world(self, vec_body: np.ndarray) -> np.ndarray:
+        """Rotate a body-frame 3-vector into the world frame using current
+        roll/pitch/yaw (ZYX intrinsic convention)."""
+        r, p, y = np.radians(self._att_deg)
+        cr, sr = np.cos(r), np.sin(r)
+        cp, sp = np.cos(p), np.sin(p)
+        cy, sy = np.cos(y), np.sin(y)
+        R = np.array([
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp,     cp * sr,                cp * cr               ],
+        ])
+        return R @ vec_body
 
     def update_from_vision(self,
                             gate_center_px: Tuple[float, float],
