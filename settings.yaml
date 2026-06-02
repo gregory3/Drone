@@ -19,7 +19,7 @@ perception:
   gate_min_area_px: 400       # Minimum contour area to count as a gate candidate
   gate_max_area_px: 180000
   gate_confidence_threshold: 0.55
-  detection_history_frames: 5 # Frames to hold a gate prediction when lost
+  detection_history_frames: 20 # Frames to hold a gate prediction when lost (ride through brief dropouts before recovery)
   temporal_smoothing_frames: 4 # Smooth gate detections across recent frames
   temporal_smoothing_miss_tolerance: 2 # Keep last smoothed detection for short dropouts
   detection_max_center_jump_px: 120 # Reject inconsistent detections from history
@@ -54,10 +54,10 @@ planning:
   gate_pass_plane_dist_m: 0.2     # Signed distance beyond gate plane to count as passed
   waypoint_tolerance_m: 0.3       # Distance at which a waypoint is considered reached
   lookahead_gates: 2              # How many gates ahead to pre-plan
-  recovery_search_yaw_rate: 30.0  # deg/s yaw sweep when gate is lost
+  recovery_search_yaw_rate: 15.0  # deg/s yaw sweep when gate is lost (gentler so a brief loss doesn't spin away)
   recovery_climb_m: 0.3           # Slight altitude gain during recovery
   recovery_resume_confirm_frames: 2  # Frames of stable detection required to exit recovery
-  takeoff_duration_s: 2.0         # Climb hard off the pad for this long at race start
+  takeoff_duration_s: 1.0         # Lift off the pad (~2.5m), then resume gate-following with gate 0 in view
   takeoff_climb_mps: 2.5          # Commanded climb rate during takeoff (NED up)
 
 control:
@@ -78,8 +78,8 @@ control:
   # MAVLink control backend (official AI-GP sim runs ACRO/rate mode, so
   # velocity setpoints are ignored — must command body rates + thrust).
   mavlink_control_mode: "attitude"   # "attitude" (ACRO sim) | "velocity" (GUIDED sim)
-  att_tilt_per_mps_deg: 5.0    # desired tilt angle per m/s of demanded body velocity
-  att_rate_kp: 6.0             # body-rate (rad/s) per rad of attitude error
+  att_tilt_per_mps_deg: 4.5    # desired tilt angle per m/s of demanded body velocity (forward authority vs keeping gate in frame)
+  att_rate_kp: 5.0             # body-rate (rad/s) per rad of attitude error
   att_max_rate_dps: 400.0      # body-rate command clamp
   hover_thrust: 0.32           # collective thrust to hover (0..1); takeoff threshold ~0.3-0.35 on the AI-GP sim
   thrust_kp_climb: 0.12        # thrust per (m/s) of desired climb rate (enough to lift off)

@@ -658,6 +658,17 @@ class MavlinkSimInterface(SimInterface):
         return [g.position_ned.copy() for g in ordered]
 
     # -------------------------------------------------- introspection helpers
+    def is_armed(self) -> bool:
+        """True once the race is active and the drone has been armed.
+
+        Used by the autonomy loop to hold its flight logic (takeoff, control,
+        camera watchdog) until the race actually starts. When auto-arm is off,
+        always report ready so manual flows aren't blocked.
+        """
+        if not self._auto_arm:
+            return True
+        return self._race_armed
+
     def get_gates(self) -> Optional[List[GateInfo]]:
         with self._lock:
             gates = self._snap.gates
@@ -726,6 +737,9 @@ class MavlinkSimInterface(SimInterface):
             print("[MavlinkSim] Race active — throttle down before arm...",
                   flush=True)
         elif self._arm_state == "throttle_down":
+            # Drive throttle-down from here (the autonomy loop is holding until
+            # armed, so it isn't sending), then arm once the window elapses.
+            self._send_throttle_down()
             if now - self._throttle_down_start >= self._arm_throttle_down_s:
                 self.arm()
                 self._arm_state = "armed"

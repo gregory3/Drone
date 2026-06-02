@@ -192,6 +192,19 @@ class AutonomyLoop:
 
         self._gate_passed_this_cycle = False
 
+        # --- wait for the race to go active before doing anything ---
+        # On the AI-GP sim there is no telemetry/camera and the drone isn't
+        # armed until the user starts the race. Hold here (resetting the clock
+        # and the camera watchdog) so takeoff begins exactly when the race does
+        # and the watchdog doesn't fire on the pre-race black screen.
+        if hasattr(self._sim, "is_armed") and not self._sim.is_armed():
+            self._start_t = t0
+            self._black_since = None
+            if self._loop_count % 200 == 0:
+                print("  [waiting] race not active yet — click RACE in the sim")
+            self._loop_count += 1
+            return False
+
         # --- takeoff: climb hard off the pad before gate-following begins ---
         # The sim won't translate until airborne, and the confidence-scaled
         # speed limit otherwise throttles the climb too much to lift off.
