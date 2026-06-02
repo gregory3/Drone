@@ -325,31 +325,54 @@ def test_classical_detector_finds_orange_rect():
     det = ClassicalGateDetector()
     frame = np.full((480, 640, 3), 80, dtype=np.uint8)
 
-    # Draw a synthetic orange rectangle matching our HSV range
-    # config gate_hsv_lower=[20,80,80], gate_hsv_upper=[40,255,255]
-    # Hue 30 (orange) in OpenCV HSV
+    # Round-1 gates render as SOLID red/orange squares, so draw a filled gate.
     orange_bgr = (0, 165, 255)   # OpenCV BGR orange
     cv2.rectangle(frame, (250, 150), (400, 330), orange_bgr, -1)
 
     results = det.detect(frame)
-    assert len(results) > 0, "Expected at least one detection on orange rect"
+    assert len(results) > 0, "Expected at least one detection on orange gate"
     assert results[0].confidence > 0.1
 
 
 def test_classical_detector_finds_red_gate():
-    """Round-1 gates render red; the multi-range HSV must catch them."""
+    """Round-1 gates render as solid red squares; multi-range HSV must catch them."""
     from perception.gate_detector import ClassicalGateDetector
     import cv2
 
     det = ClassicalGateDetector()
     frame = np.full((480, 640, 3), 80, dtype=np.uint8)
-    # Pure red rectangle (BGR). Red wraps the hue boundary -> needs the
+    # Solid red square (BGR). Red wraps the hue boundary -> needs the
     # configured red sub-ranges, not just the orange primary.
     cv2.rectangle(frame, (250, 150), (400, 330), (0, 0, 255), -1)
 
     results = det.detect(frame)
     assert len(results) > 0, "Expected a detection on the red gate"
     assert results[0].confidence > 0.1
+
+
+def test_classical_detector_rejects_red_with_green_twin():
+    """A red blob beside a comparable green blob is the start light, not a gate.
+
+    This is the fly16 failure: the detector chased a red/green light pair at
+    conf 0.76 instead of a gate, and the drone flew off."""
+    from perception.gate_detector import ClassicalGateDetector
+    import cv2
+
+    det = ClassicalGateDetector()
+    # A lone red gate is detected.
+    gate_frame = np.full((480, 640, 3), 80, dtype=np.uint8)
+    cv2.rectangle(gate_frame, (290, 210), (350, 270), (0, 0, 255), -1)
+    gate = det.detect(gate_frame)
+    assert len(gate) > 0, "lone red gate should be detected"
+
+    # Same red blob, now with a green twin right beside it -> rejected.
+    light_frame = np.full((480, 640, 3), 80, dtype=np.uint8)
+    cv2.rectangle(light_frame, (290, 210), (350, 270), (0, 0, 255), -1)
+    cv2.rectangle(light_frame, (360, 210), (420, 270), (0, 255, 0), -1)
+    light = det.detect(light_frame)
+    # The red blob with a green twin must not survive as a confident gate.
+    assert not any(d.center_px[0] < 360 and d.confidence > 0.1 for d in light), \
+        "red blob with adjacent green twin must be rejected as a start light"
 
 
 def test_classical_detector_temporal_smoothing_persists_through_short_dropout():
@@ -359,7 +382,7 @@ def test_classical_detector_temporal_smoothing_persists_through_short_dropout():
     det = make_detector("classical")
     frame = np.full((480, 640, 3), 80, dtype=np.uint8)
     orange_bgr = (0, 165, 255)
-    cv2.rectangle(frame, (250, 150), (400, 330), orange_bgr, -1)
+    cv2.rectangle(frame, (250, 150), (400, 330), orange_bgr, 14)  # hollow gate
 
     initial = det.detect(frame)
     assert len(initial) == 1
@@ -376,6 +399,72 @@ def test_classical_detector_temporal_smoothing_persists_through_short_dropout():
     assert len(third) == 1
     fourth = det.detect(blank)
     assert len(fourth) == 0, "Temporal smoothing should expire after repeated misses"
+
+
+class _FixedDetector:
+    """Returns a preset list of detections each call (highest-conf first)."""
+    def __init__(self, batches):
+        self._batches = list(batches)
+        self._i = 0
+
+    def detect(self, frame_bgr):
+        out = self._batches[min(self._i, len(self._batches) - 1)]
+        self._i += 1
+        return list(out)
+
+
+def _det(cx, cy, area, conf):
+    from perception.gate_detector import GateDetection
+    w = h = int(area ** 0.5)
+    return GateDetection(center_px=(cx, cy),
+                         bbox_px=(int(cx - w / 2), int(cy - h / 2), w, h),
+                         area_px=float(area), confidence=conf)
+
+
+def test_temporal_detector_picks_nearest_not_highest_confidence():
+    # Two gates in view: a near one (big area, lower conf) and a far one
+    # (small area, higher conf). "nearest" policy must pick the near one.
+    from perception.gate_detector import TemporalGateDetector
+    near = _det(300, 180, area=40000, conf=0.6)
+    far = _det(500, 120, area=4000, conf=0.95)
+    backend = _FixedDetector([[far, near]])
+    det = TemporalGateDetector(backend, history_frames=1, max_missed_frames=0,
+                               max_center_jump_px=120, select="nearest")
+    out = det.detect(None)
+    assert out[0].area_px == 40000, "should lock the nearest (largest) gate"
+
+
+def test_temporal_detector_keeps_lock_via_continuity():
+    # Locked on near gate; next frame a far gate spikes in confidence. Continuity
+    # must keep us on the near gate (it only moved a little), not jump to far.
+    from perception.gate_detector import TemporalGateDetector
+    near0 = _det(300, 180, area=40000, conf=0.6)
+    near1 = _det(310, 185, area=46000, conf=0.6)   # same gate, grown slightly
+    far = _det(560, 90, area=3000, conf=0.99)      # far gate, far away in image
+    backend = _FixedDetector([[near0], [far, near1]])
+    det = TemporalGateDetector(backend, history_frames=1, max_missed_frames=0,
+                               max_center_jump_px=120, select="nearest",
+                               continuity=True)
+    det.detect(None)                # lock near0
+    out = det.detect(None)          # far spikes, but near1 is close to lock
+    assert abs(out[0].center_px[0] - 310) < 30, "continuity should hold the lock"
+
+
+def test_vision_gate_pass_fires_on_large_then_lost(monkeypatch):
+    from drone_main import AutonomyLoop
+    import config.loader as loader
+    monkeypatch.setattr(loader.cfg.sim, "mock_use_course", False)
+    loop = AutonomyLoop(mode="mock")
+    loop._course = None  # force the vision-only path
+
+    big_centered = _det(loop._camera_cx, loop._camera_cy,
+                        area=loop._pass_area_px + 1000, conf=0.9)
+    # Gate is large + centered -> arm "close", no pass yet.
+    assert loop._check_vision_gate_pass(True, big_centered) is False
+    assert loop._gate_was_close is True
+    # Gate drops out of fresh view -> declare a pass.
+    assert loop._check_vision_gate_pass(False, None) is True
+    assert loop._gate_was_close is False
 
 
 def test_make_detector_onnx_raises_when_model_missing(monkeypatch, tmp_path):

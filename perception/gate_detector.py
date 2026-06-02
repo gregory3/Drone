@@ -111,8 +111,45 @@ class ClassicalGateDetector(GateDetector):
         self._min_area = p.gate_min_area_px
         self._max_area = p.gate_max_area_px
         self._conf_thresh = p.gate_confidence_threshold
+        # Start-light rejection: gates render as solid red squares (same colour
+        # as the start light), so the discriminator is the light's GREEN twin.
+        self._reject_green_twin = getattr(p, "gate_reject_green_twin", True)
+        self._green_lower = np.array(getattr(p, "green_hsv_lower", [40, 80, 80]),
+                                     dtype=np.uint8)
+        self._green_upper = np.array(getattr(p, "green_hsv_upper", [90, 255, 255]),
+                                     dtype=np.uint8)
         self._gate_real_size_m = 1.2   # assume 1.2m gate for distance est.
         self._fx = (p.image_width / 2) / np.tan(np.radians(p.camera_fov_deg / 2))
+
+    def _has_green_twin(self, green_mask, x: int, y: int,
+                        w: int, h: int) -> bool:
+        """True if a comparable green blob sits just beside this red blob.
+
+        The start light is a red+green pair, so a red candidate with a green
+        companion roughly its own size, vertically aligned and within ~2 widths
+        horizontally, is the light, not a gate.
+        """
+        if green_mask is None:
+            return False
+        # Search band: same rows (a little taller), extended left+right by ~2w.
+        pad_x = max(int(2 * w), 20)
+        x0 = max(0, x - pad_x)
+        x1 = min(green_mask.shape[1], x + w + pad_x)
+        y0 = max(0, y - int(0.3 * h))
+        y1 = min(green_mask.shape[0], y + h + int(0.3 * h))
+        band = green_mask[y0:y1, x0:x1]
+        if band.size == 0:
+            return False
+        cnts, _ = cv2.findContours(band, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        red_area = float(w * h)
+        for c in cnts:
+            gx, gy, gw, gh = cv2.boundingRect(c)
+            g_area = float(gw * gh)
+            # Comparable size (within ~4x either way) => looks like the twin.
+            if 0.25 * red_area <= g_area <= 4.0 * red_area:
+                return True
+        return False
 
     def detect(self, frame_bgr: np.ndarray) -> List[GateDetection]:
         # --- preprocessing ---
@@ -126,6 +163,14 @@ class ClassicalGateDetector(GateDetector):
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        # Green mask — used only to spot the start light's green twin so we can
+        # reject it (gates have no green companion). Cheap; skipped if disabled.
+        if self._reject_green_twin:
+            green_mask = cv2.inRange(hsv, self._green_lower, self._green_upper)
+            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+        else:
+            green_mask = None
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
@@ -142,13 +187,22 @@ class ClassicalGateDetector(GateDetector):
             if aspect < 0.3 or aspect > 3.5:
                 continue
 
+            cx = x + w / 2
+            cy = y + h / 2
+
+            # --- start-light rejection: the sim renders a red/green light pair
+            # near the start. Gates render as solid red squares too, so colour
+            # and fill don't separate them — but the start light has a GREEN
+            # twin right beside the red blob, and a gate does not. Reject a red
+            # candidate that has a comparable green blob adjacent to it. This
+            # was the fly16 failure (detector chased the red light at conf 0.76).
+            if self._has_green_twin(green_mask, x, y, w, h):
+                continue
+
             # Confidence: penalize non-square and low fill ratio
             ideal_aspect_score = 1.0 - abs(1.0 - aspect) * 0.5
             fill_ratio = area / max(w * h, 1)
             confidence = float(np.clip(ideal_aspect_score * fill_ratio ** 0.5, 0, 1))
-
-            cx = x + w / 2
-            cy = y + h / 2
 
             # Rough monocular distance estimate using apparent width
             dist_m = (self._gate_real_size_m * self._fx) / max(w, 1) \
@@ -244,14 +298,35 @@ class ONNXGateDetector(GateDetector):
 # ---------------------------------------------------------------------------
 
 class TemporalGateDetector(GateDetector):
+    """Tracks a single gate across frames.
+
+    Two behaviours, both learned the hard way against the live AI-GP sim where
+    the course stacks several gates in view (especially after the hard right
+    turn past gate 0):
+
+    1. Target selection on acquisition follows the "next gate" principle used by
+       Swift (feeds the next gate's corners) and MonoRace (reprojects the next
+       gate from the map): pick the NEAREST gate, approximated onboard as the
+       largest apparent blob, rather than the highest-confidence one (which can
+       be a far gate down the line).
+    2. Continuity tracking: once locked, keep following THAT gate by picking the
+       raw blob nearest the last known position, instead of re-grabbing the
+       highest-confidence blob every frame. This stops the mid-approach lurch to
+       a far gate that caused the fly13 veer-off.
+    """
+
     def __init__(self, backend: GateDetector,
                  history_frames: int,
                  max_missed_frames: int,
-                 max_center_jump_px: float) -> None:
+                 max_center_jump_px: float,
+                 select: str = "nearest",
+                 continuity: bool = True) -> None:
         self._backend = backend
         self._history_frames = max(1, history_frames)
         self._max_missed_frames = max(0, max_missed_frames)
         self._max_center_jump_px = max_center_jump_px
+        self._select = select
+        self._continuity = continuity
         self._history = deque(maxlen=self._history_frames)
         self._missed_frames = 0
         self._smoothed: Optional[GateDetection] = None
@@ -259,7 +334,7 @@ class TemporalGateDetector(GateDetector):
     def detect(self, frame_bgr: np.ndarray) -> List[GateDetection]:
         raw = self._backend.detect(frame_bgr)
         if raw:
-            best = raw[0]
+            best = self._select_target(raw)
             if self._smoothed is None or self._is_consistent(best):
                 self._history.append(best)
             else:
@@ -276,6 +351,31 @@ class TemporalGateDetector(GateDetector):
         self._history.clear()
         self._smoothed = None
         return []
+
+    def _select_target(self, raw: List[GateDetection]) -> GateDetection:
+        """Pick which detection to track this frame from all candidates."""
+        # Already locked onto a gate -> stay on the nearest blob to it.
+        if self._continuity and self._smoothed is not None:
+            sx, sy = self._smoothed.center_px
+            # Allow the search window to grow while the gate is briefly missed.
+            window = self._max_center_jump_px * (1 + self._missed_frames)
+            near = [d for d in raw
+                    if np.hypot(d.center_px[0] - sx, d.center_px[1] - sy) <= window]
+            if near:
+                return min(near, key=lambda d: np.hypot(
+                    d.center_px[0] - sx, d.center_px[1] - sy))
+            # No blob near the lock -> fall through to re-acquire.
+
+        # Acquisition: "nearest" gate == largest apparent area; else highest conf.
+        if self._select == "nearest":
+            return max(raw, key=lambda d: d.area_px)
+        return max(raw, key=lambda d: d.confidence)
+
+    def reset(self) -> None:
+        """Drop the current lock so the next gate is acquired fresh."""
+        self._history.clear()
+        self._missed_frames = 0
+        self._smoothed = None
 
     def _is_consistent(self, detection: GateDetection) -> bool:
         if self._smoothed is None:
@@ -329,5 +429,7 @@ def make_detector(backend: Optional[str] = None) -> GateDetector:
             history_frames=cfg.perception.temporal_smoothing_frames,
             max_missed_frames=cfg.perception.temporal_smoothing_miss_tolerance,
             max_center_jump_px=cfg.perception.detection_max_center_jump_px,
+            select=getattr(cfg.perception, "gate_select", "nearest"),
+            continuity=getattr(cfg.perception, "gate_track_continuity", True),
         )
     return detector

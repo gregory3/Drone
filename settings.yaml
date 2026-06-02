@@ -2,10 +2,10 @@
 # All tuneable parameters live here. Never hardcode values in source files.
 
 drone:
-  max_speed_mps: 3.0          # Conservative Phase 1 cap (raise in Phase 3)
+  max_speed_mps: 2.0          # Lowered from 3.0: in fly16 the drone darted + banked 30deg+, whipping gates out of frame. Calmer = gate stays in FOV (Swift's perception-awareness, done mechanically). Raise once tracking is solid.
   max_accel_mps2: 4.0
   approach_speed_mps: 1.5     # Speed used when flying toward a detected gate
-  through_speed_mps: 2.5      # Speed maintained passing through gate center
+  through_speed_mps: 2.0      # Speed maintained passing through gate center (was 2.5)
   recovery_speed_mps: 1.0     # Speed during lost-gate recovery maneuver
 
 perception:
@@ -23,6 +23,25 @@ perception:
   temporal_smoothing_frames: 4 # Smooth gate detections across recent frames
   temporal_smoothing_miss_tolerance: 2 # Keep last smoothed detection for short dropouts
   detection_max_center_jump_px: 120 # Reject inconsistent detections from history
+
+  # Gate selection policy when several gates are visible at once (the course
+  # stacks gates along the line, especially after a turn). Swift/MonoRace both
+  # target the NEXT gate in sequence, which in onboard view is the nearest one.
+  # "nearest" = pick the largest apparent gate (closest); "confidence" = legacy
+  # highest-confidence pick (jumps to far gates — caused fly13 veer-off).
+  gate_select: "nearest"          # "nearest" | "confidence"
+  # Start-light rejection: the sim renders gates as SOLID red squares (same hue
+  # as the start light), so colour/fill can't separate them. The start light's
+  # tell is its GREEN twin right beside the red blob; gates have none. Reject a
+  # red candidate that has a comparable green blob adjacent (fly16: the detector
+  # chased the red/green start light at conf 0.76 and the drone flew off).
+  gate_reject_green_twin: true
+  green_hsv_lower: [40, 80, 80]
+  green_hsv_upper: [90, 255, 255]
+  # Once locked onto a gate, keep tracking THAT gate frame-to-frame by spatial
+  # continuity (nearest blob to last position) instead of re-grabbing the
+  # highest-confidence blob. Stops the lurch to a far gate mid-approach.
+  gate_track_continuity: true
 
   # HSV color ranges for Round 1 highlighted gates (tune in sim).
   # Primary range = orange. Round-1 gates in the official sim render RED, which
@@ -57,6 +76,12 @@ planning:
   recovery_search_yaw_rate: 15.0  # deg/s yaw sweep when gate is lost (gentler so a brief loss doesn't spin away)
   recovery_climb_m: 0.3           # Slight altitude gain during recovery
   recovery_resume_confirm_frames: 2  # Frames of stable detection required to exit recovery
+  # Vision-only gate-pass detection (used when no global course/map is available,
+  # i.e. the live AI-GP MAVLink sim). A gate that grows large + centered then is
+  # lost means we flew through it -> advance to the next gate. Mirrors how
+  # Swift/MonoRace step through the gate sequence.
+  gate_pass_area_frac: 0.10       # Apparent gate area / image area to count as "close"
+  gate_pass_center_frac: 0.40     # |pixel offset| / image dim to count as "centered"
   takeoff_duration_s: 1.0         # Lift off the pad (~2.5m), then resume gate-following with gate 0 in view
   takeoff_climb_mps: 2.5          # Commanded climb rate during takeoff (NED up)
 
@@ -81,7 +106,7 @@ control:
   att_tilt_per_mps_deg: 4.5    # desired tilt angle per m/s of demanded body velocity (forward authority vs keeping gate in frame)
   att_rate_kp: 5.0             # body-rate (rad/s) per rad of attitude error
   att_max_rate_dps: 400.0      # body-rate command clamp
-  hover_thrust: 0.32           # collective thrust to hover (0..1); takeoff threshold ~0.3-0.35 on the AI-GP sim
+  hover_thrust: 0.27           # collective thrust to hold altitude (measured ~0.26 on the AI-GP sim). Was 0.32 -> drone climbed the whole flight, gates fell below the 20deg-up camera, flew out of bounds -> DSQ. Takeoff lift comes from the climb term + takeoff phase, NOT from over-trimming hover.
   thrust_kp_climb: 0.12        # thrust per (m/s) of desired climb rate (enough to lift off)
   thrust_kd_climb: 0.08        # thrust damping per (m/s) of actual climb rate
   thrust_min: 0.1
@@ -100,7 +125,7 @@ sim:
   port: 5760
   mavlink_port: 14550          # AI-GP sim (FlightSim.exe) MAVLink UDP port
   vision_port: 5600            # AI-GP sim camera JPEG stream UDP port
-  connect_timeout_s: 10.0
+  connect_timeout_s: 60.0      # Wait long enough to navigate the sim menus (DSQ -> FLY -> pre-flight) before giving up on the heartbeat
   camera_dead_timeout_s: 2.5   # Abort run if camera frames are black this long (sim camera died)
   step_hz: 50                  # How fast we tick the main loop
   mock_use_course: true         # Use the mock course positions when in mock mode

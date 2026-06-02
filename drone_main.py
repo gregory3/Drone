@@ -95,6 +95,19 @@ class AutonomyLoop:
         self._last_detection = None
         self._detection_age = 0
 
+        # Vision-only gate-pass tracking (no global course/map, i.e. live AI-GP
+        # MAVLink sim). We can't measure when state.pos crosses the gate plane
+        # because EKF position is unreliable, so we infer the pass from the
+        # image: the gate grows large + centered (we're about to fly through it)
+        # and then drops out of view (we're through). Same sequence-stepping idea
+        # as Swift/MonoRace, done from monocular appearance alone.
+        self._gate_was_close = False
+        self._img_area_px = float(cfg.perception.image_width *
+                                  cfg.perception.image_height)
+        self._pass_area_px = (getattr(cfg.planning, "gate_pass_area_frac", 0.10)
+                              * self._img_area_px)
+        self._pass_center_frac = getattr(cfg.planning, "gate_pass_center_frac", 0.40)
+
         self._camera_fx = (cfg.perception.image_width / 2) / np.tan(
             np.radians(cfg.perception.camera_fov_deg / 2)
         )
@@ -346,7 +359,15 @@ class AutonomyLoop:
         self._estimator.set_command_velocity(np.array([ctrl.vx, ctrl.vy, ctrl.vz]))
 
         # --- check gate passage ---
-        if gate_detected and best_det.distance_est_m is not None:
+        # Vision-only path (no global course/map — live AI-GP sim). Infer the
+        # pass from appearance: gate grows large + centered, then drops out.
+        if self._course is None:
+            if self._check_vision_gate_pass(gate_detected_actual, best_det):
+                self._on_gate_passed(t_rel)
+                self._gate_passed_this_cycle = True
+
+        if not self._gate_passed_this_cycle and gate_detected \
+                and best_det.distance_est_m is not None:
             if best_det.distance_est_m < self._gate_passed_threshold_m:
                 self._on_gate_passed(t_rel)
                 self._gate_passed_this_cycle = True
@@ -576,8 +597,42 @@ class AutonomyLoop:
             return
 
         self._last_gate_pos = None
+        # Drop the held detection so we don't keep steering toward the gate we
+        # just passed; the detector re-acquires the next (now nearest) gate.
+        self._gate_was_close = False
+        self._last_detection = None
+        self._detection_age = 0
+        if hasattr(self._detector, "reset"):
+            self._detector.reset()
         self._recovery.reset()
         self._controller.reset()
+
+    def _check_vision_gate_pass(self, gate_detected_actual: bool,
+                                best_det) -> bool:
+        """Detect a gate pass from monocular appearance alone.
+
+        Returns True on the frame where we judge the current gate was just
+        flown through. Logic: arm a 'close' flag once a *fresh* detection is
+        both large (we're nearly on top of it) and roughly centered (we're
+        lined up to pass), then fire when that gate drops out of fresh view
+        (we're through it). Used only when no global course/map is available.
+        """
+        if gate_detected_actual and best_det is not None:
+            u, v = best_det.center_px
+            off_x = abs(u - self._camera_cx) / cfg.perception.image_width
+            off_y = abs(v - self._camera_cy) / cfg.perception.image_height
+            centered = (off_x < self._pass_center_frac and
+                        off_y < self._pass_center_frac)
+            if best_det.area_px >= self._pass_area_px and centered:
+                self._gate_was_close = True
+            return False
+
+        # No fresh detection this frame. If the gate was close just before it
+        # vanished, we flew through it.
+        if self._gate_was_close:
+            self._gate_was_close = False
+            return True
+        return False
 
     def _course_direction(self, state_pos: np.ndarray, gate_world: np.ndarray) -> np.ndarray:
         if self._course is None or len(self._course) == 0:

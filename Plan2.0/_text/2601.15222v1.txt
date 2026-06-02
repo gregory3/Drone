@@ -1,0 +1,2463 @@
+
+===== PAGE 1 =====
+MonoRace: Winning Champion-Level Drone
+Racing with Robust Monocular AI
+Stavrow A. Bahnam†, Robin Ferede∗,†, Till M. Blaha, Anton E. Lang,
+Erin Lucassen, Quentin Missinne, Aderik E.C. Verraest,
+Christophe De Wagter, Guido C.H.E. de Croon
+Control & Operation, Delft University of Technology, Delft & 2629 HS, The Netherlands.
+∗Corresponding author. Email: R.Ferede@tudelft.nl
+†These authors contributed equally to this work.
+Autonomous drone racing represents a major frontier in robotics research. It
+requires an Artificial Intelligence (AI) that can run on board light-weight flying
+robots under tight resource and time constraints, while pushing the physical sys-
+tem to its limits. The state of the art in this area consists of a system with a stereo
+camera and an inertial measurement unit (IMU) that beat human drone racing
+champions in a controlled indoor environment. Here, we present MonoRace: an
+onboard drone racing approach that uses a monocular, rolling-shutter camera
+and IMU that generalizes to a competition environment without any external
+motion tracking system. The approach features robust state estimation that com-
+bines neural-network-based gate segmentation with a drone model. Moreover, it
+includes an offline optimization procedure that leverages the known geometry of
+gates to refine any state estimation parameter. This offline optimization is based
+purely on onboard flight data and is important for fine-tuning the vital exter-
+nal camera calibration parameters. Furthermore, the guidance and control are
+performed by a neural network that foregoes inner loop controllers by directly
+sending motor commands. This small network runs on the flight controller at 500
+Hz. The proposed approach won the 2025 Abu Dhabi Autonomous Drone Racing
+Competition (A2RL), outperforming all competing AI teams and three human
+world champion pilots in a direct knockout tournament. It set a new milestone in
+autonomous drone racing research, reaching speeds up to 100 km/h on the com-
+petition track and successfully coping with problems such as camera interference
+and IMU saturation.
+1
+arXiv:2601.15222v1  [cs.RO]  21 Jan 2026
+
+===== PAGE 2 =====
+INTRODUCTION
+Autonomous drone racing (ADR) is a proving ground for high-speed perception, state estimation,
+planning, and control (1,2). The high speeds attained in drone racing represent a major challenge
+for the algorithms empowering autonomous flight. At such speeds, complex aerodynamic effects
+become increasingly difficult to model (3), undermining both conventional control approaches
+and the simulation environments used for learning-based methods. In addition, computer vision
+in autonomous drone racing is considerably hampered by the large inter-frame displacements of
+imaged objects, resulting in high optical flow and motion blur. Furthermore, autonomous drone
+racing rewards pushing the physical drone system to its limits, requiring close-to-optimal control
+while being constrained by the requirement of fast, onboard processing.
+In recent years, autonomous drone racing has seen rapid advances in control, perception, and
+state estimation. Early control approaches relied on differential-flatness-based trajectory tracking
+(4,5,6,7), followed by nonlinear model predictive control (NMPC) for faster and more aggressive
+flight (8,9,10,11,12,13,14,15). Today, neural network controllers trained with deep reinforcement
+learning represent the state of the art (16,17,18,19,20), increasingly replacing modular trajectory-
+tracking pipelines. Recent work further replaces even low-level controllers with neural networks
+(21,22,23,24). On the perception side, the best results to date are obtained by stereo Visual Inertial
+Odometry (VIO) with geometric gate detection, fused through EKF-based state estimation (20,25).
+Although learned monocular VIO (26, 27, 28), visual-model-predictive localization (29, 30) and
+end-to-end vision-based policies (31,32,33,34) are emerging as promising alternatives, they have
+not yet matched this state-of-the-art performance.
+These advancements in autonomous drone racing have been stimulated by international com-
+petitions. Initially, these were purely an academic affair and organized alongside the IEEE IROS
+conferences. The first series of ADR competitions ran alongside IROS from 2016 to 2019: top
+speeds grew from 0.6 m/s (Daejeon, 2016) (35) to 0.7 m/s (Vancouver, 2017) (1), 2.0 m/s (Madrid,
+2018), and 2.5 m/s (Macau, 2019). In 2019, Lockheed Martin and the Drone Racing League raised
+the bar with the AlphaPilot/AIRR series—a four-event competition with standardized hardware
+and a $1 M prize. TU Delft’s MAVLab won the championship with an average velocity of 6.8 m/s
+and a peak of 9.2 m/s (30), an order-of-magnitude jump over the early IROS speeds, while UZH’s
+runner-up reached up to 8 m/s on the same platform (36). Even so, human FPV drone racing pilots
+remained faster on comparable tracks.
+In 2022, the ‘Swift’ approach (20) enabled an autonomous drone for the first time to beat
+champion-level pilots in head-to-head races. Perception and state estimation of Swift combined the
+Intel RealSense stereo Visual-Inertial Odometry (VIO), deep-neural-network-based gate detection
+on a front-looking camera, and a learned residual observation model trained with motion-capture
+supervision. Control was handled by a deep-RL policy that outputs the same low-level commands
+as human pilots (collective thrust and body rates). On an indoor track with peak speeds around 22
+m/s (2), Swift won multiple heats and set the fastest recorded time, making it the first champion-level
+2
+
+===== PAGE 3 =====
+performance by an autonomous system.
+However, several challenges remain on the way to real-world application of this technology
+(20,37). Importantly, the AI for autonomous drone racing should not rely on external infrastructure
+such as a motion tracking system. Achieving independence from external infrastructure will reduce
+economic costs and substantially broaden the types of environments in which it can be applied.
+Moreover, it is desirable to further reduce the number of sensors used by the ADR solution,
+preferably only using a single forward-looking camera and onboard inertial sensors.
+The outstanding challenges in autonomous drone racing have led to the organization of a
+new international competition. The Abu Dhabi Autonomous Racing League (A2RL) and Drone
+Champions League (DCL) organized a new drone racing competition with a $1 M price pool in
+April 2025. The goal of the competition was to push the state of the art by enforcing fully onboard
+perception with a single rolling-shutter CMOS camera and prohibiting any external aids at any
+stage. To this end, the organizers created the drone hardware accordingly and determined both the
+race track and the competition hall, which did not feature a motion tracking system. Nor did they
+allow any modification or the precision measurement of the track.
+The competition was held on April 11 and 12, 2025, in Abu Dhabi. It comprised multiple events
+in which the autonomous racing drones competed with each other, with as main event being the
+“Grand Challenge” that focused on a single-drone time trial. At the same dates and in the same
+space, human FPV drone racing pilots competed in the DCL “Falcon cup”. The best-ranked human
+FPV pilots were subsequently pitted against the best-ranked autonomous drones in a direct knockout
+tournament, starting with quarter finals (so in total three rounds till victory).
+In this article, we present an onboard drone racing approach that only uses a single, rolling-
+shutter camera and an Inertial Measurement Unit (IMU). The approach won the above-mentioned
+Grand Challenge. Moreover, it enabled an autonomous drone to win for the first time an indepen-
+dently organized human vs. AI drone racing competition, sequentially beating three human FPV
+world champions in a direct knockout tournament. The approach includes a particularly robust state
+estimation pipeline that combines neural-network-based gate segmentation with a drone model. The
+robustness is illustrated by the fact that it can handle 50% corrupted images. Moreover, the state
+estimation can cope with the saturation of accelerometers, which regularly occurred in the high-𝑔
+maneuvers during the very fast flight through the indoor racing track. Furthermore, we present an
+offline optimization procedure that leverages the known shapes and sizes of gates to refine any state
+estimation parameter. This offline optimization is based purely on onboard flight data and enables
+self-supervised post-flight fine-tuning of any vital parameters, like the external camera calibration.
+The guidance and control in our system are executed by a single neural network, a Guidance-and-
+Control Network (G&CNet), which maps the estimated state directly to control actions. Originally
+developed for optimal real-time spacecraft landing (38), this concept has recently been adapted to
+high-speed quadrotor flight (24). The G&CNet is trained in simulation using reinforcement learning
+and directly outputs motor commands, fully replacing traditional inner-loop controllers. Until now,
+however, such nets relied on state estimates from highly accurate external motion-capture systems.
+3
+
+===== PAGE 4 =====
+In contrast, our approach uses only onboard vision-based state estimation. The resulting small net-
+work (only 3×64 neurons) runs on the 32-bit flight controller at 500 Hz and is able to successfully
+cross the reality gap. The proposed drone racing approach set a new milestone in autonomous drone
+racing research, beating all other AI systems and three human world-champion FPV racers, while
+reaching speeds up to 100 km/h on the competition track.
+RESULTS
+Competition Format
+The ‘A2RL x DCL’ race was held in April 2025 in a 100 × 30 m indoor hall and featured a track with
+11 square gates, each with a 1.5 m inner opening. A photograph of the track can be seen in Fig. 1,
+included two double-gates and a split-S maneuver, where the drone passed through an upper gate
+before diving directly through a lower gate beneath it in the opposite direction. The objective was
+to complete two laps in minimal time. The organizers defined the completion time as the interval
+from the first passage of Gate 1 to the second passage of Gate 11. No external localization system
+was provided nor allowed, so all state estimation, control, and any fine-tuning had to rely solely on
+onboard sensing.
+The event comprised the following four challenges:
+1. Grand Challenge — 15 minutes individual trial for AI teams (fastest time counts).
+2. AI vs Human — three knockout rounds in a head-to-head race (AI teams and FPV pilots).
+3. Multi-Drone Race — single race with four AI drones flying simultaneously.
+4. Drag Race — an 83 m straight track with four gates, with a choice between two middle gates.
+Our system won the Grand Challenge, AI vs Human, and Drag Race, and placed third in
+the Multi-Drone Race due to the absence of collision-avoidance capabilities, while more than
+doubling the speed of the slowest drones. This paper focuses on the first two events. MonoRace
+is specifically designed for these scenarios, emphasizing high-speed, agile autonomous flight with
+onboard perception.
+Performance
+Our controller achieved the fastest completion time of 16.56 s, outperforming three world champion-
+level FPV pilots. The official organizer-recorded times1 for the knockout rounds are shown in
+1The times in Fig. 1 are provided by the race organizers and are measured using a VTx-based RF timing system (39).
+All other times reported in this paper use our onboard state-estimation–based timing, which explains the small numerical
+differences.
+4
+
+===== PAGE 5 =====
+A
+B
+C
+D
+Quarter Finals
+Semi Finals
+Final
+Runner Up
+Heat
+Time
+Pilot / Team
+Type
+1
+17.18
+MAVLAB: M17
+AI
+1
+x
+VICENT
+HUMAN
+Heat
+Time
+Pilot / Team
+Type
+3
+x
+KAIST
+AI
+3
+24.07
+KILLIAN
+HUMAN
+Heat
+Time
+Pilot / Team
+Type
+4
+x
+FLY FOR FUTURE
+AI
+4
+23.06
+YUKI
+HUMAN
+Heat
+Time
+Pilot / Team
+Type
+2
+x
+TII RACING
+AI
+2
+26.01
+PLATONAIR
+HUMAN
+Heat
+Time
+Pilot / Team
+Type
+6
+16.59
+MAVLAB: M16
+AI
+6
+x
+KILLIAN
+HUMAN
+Heat
+Time
+Pilot / Team
+Type
+5
+20.74
+YUKI
+HUMAN
+5
+x
+PLATONAIR
+HUMAN
+Heat
+Time
+Pilot / Team
+Type
+7
+19.71
+KILLIAN
+HUMAN
+7
+19.14
+PLATONAIR
+HUMAN
+Heat
+Time
+Pilot / Team
+Type
+8
+x
+MAVLAB: M16
+AI
+8
+x
+YUKI
+HUMAN
+Figure 1: (A) Close-up of the supplied externally made competition robot with its 5.1-inch pro-
+pellers, its drone-race autopilot board with normal IMU, a single CMOS rolling-shutter camera
+connected to a GPU-equipped NVIDIA ORIN NX companion computer, and 8 bright orange LED
+strips to provide good visibility for the spectators. The robot is looking at an ‘A2RL x DCL’ com-
+petition gate. (B) A time-lapse of the robot performing the split-S maneuver. (C) Overview of the
+entire track. The races consisted of two laps through eleven gates. Four robots are shown at the four
+start positions during a multi-robot race. (D) Results of the AI against human races.
+5
+
+===== PAGE 6 =====
+Fig. 1. This result demonstrates that G&CNets with low-level motor control can exceed human
+performance in high-speed drone racing. During the competition, we trained a variety of neural
+network controllers, summarized in Table 1. Each network was named after its fastest real-world
+completion time, rounded down to the nearest second and prefixed with an ”M” (e.g., M16 for a
+policy completing the track in approximately 16 s). The comparison of lap times across different
+G&CNets in Fig. 2 illustrates a clear trade-off between speed and robustness: more aggressive
+controllers consistently produced faster laps, whereas more conservative controllers prioritized
+safety and reliability. Remarkably, our most reliable network M23, completed 43 flights with an
+88.4% success rate, where most mishaps were development or hardware-related.
+Fig. 2 also presents the performance of 100 rollouts in our simulation environment for each
+network. Following the approach of (24), we applied domain randomization to all model parameters;
+for this evaluation, we used 30% randomization for all parameters. All networks maintained an
+approximately 90% success rate despite substantial randomization. Robustness of the control for
+variations in drone properties is obtained by using even stronger randomization during training2
+(See parameters in Table 1). The results show that real-world completion times closely match the
+average simulated times, highlighting randomized simulation as a powerful and reliable tool for
+predicting real-world performance. Simulated crash rates, in contrast, were less predictive, as the
+simulator does not accurately model vision-based state estimation errors that occasionally caused
+real-world crashes.
+The robustness of our approach becomes most evident when analyzing the trajectory of our
+fastest lap as seen in Fig. 2. Measured specific forces, moments, and motor speeds deviated
+substantially from the nominal model but largely stayed within — and at times exceeded — the
+30% randomization bounds. Even in instances where the measurements exceeded these limits, the
+controller maintained stable flight and completed the lap. This ability to operate reliably beyond
+the nominal design envelope highlights the power of excessive randomization in training, allowing
+the drone to handle unmodeled dynamics while still achieving human-beating performance.
+Evaluation and optimization with gate reprojections
+One of the great challenges of the A2RL competition is the absence of any external motion tracking
+or positioning system. This prevents the use of any “ground truth” position, which is typically used
+for fitting the drone’s parameters or simply debugging the state estimation pipeline. We therefore
+combine the drone’s onboard images with the known sizes and shapes of the racing gates to still
+allow for evaluation and optimization in the absence of any external ground truth system.
+Our proposed evaluation and optimization method is rooted in “prediction error minimization”,
+a central concept in both state estimation filters (40) and theories on the functioning of human brains
+(41). Ignoring observation noise, a perfect state estimate will result in a perfect correspondence
+2LAP16 is an exception, as some parameters use less than 30% randomization. However, most parameters are
+randomized ≥40%, and evaluation with 30% randomization still achieves a 94% success rate.
+6
+
+===== PAGE 7 =====
+Model
+M16
+M17
+M18
+M19
+M22
+M23
+Retrained from
+M17
+X
+X
+X
+M23
+X
+Initialization
+from ground
+uniform
+uniform
+uniform
+uniform
+uniform
+𝜃cam (deg)
+50
+43
+43
+43
+43
+45
+𝑔size (m)
+0.55∗
+0.45
+0.50
+0.45
+0.40
+0.40
+𝑔thickness (m)
+0.8∗
+1
+1
+1
+1
+1
+ℎground (m)
+0.4
+0
+0
+0
+0
+0
+𝑣ground (m/s)
+10
+2
+2
+2
+2
+2
+Rewards
+𝜆prog
+0
+1
+1
+1
+1
+1
+𝑣𝑚𝑎𝑥
+-
+99
+99
+99
+10
+10
+𝜆gate
+30
+10
+1
+1
+0
+1.5
+𝜆Ω
+0
+0.001
+0.001
+0.001
+0.001
+0.001
+𝜆offset
+2
+0
+1
+1
+0
+1.5
+𝜆perc
+0.1
+0.05
+0.01
+0.01
+0.01
+0.01
+𝜆Δ𝒖
+0.100
+0.005
+0
+0
+0
+0
+Δ𝑢thresh
+0.5
+0.3
+0
+0
+0
+0
+𝜆𝒖
+0
+0
+0
+0.01
+0
+0
+𝜆crash
+10
+10
+10
+10
+10
+10
+Parameter
+Nominal
+Randomization
+𝑘𝜔
+1.55 × 10−6
+15
+40
+40
+50
+50
+50
+𝑘𝑥
+5.37 × 10−5
+20
+40
+40
+50
+50
+50
+𝑘𝑦
+5.37 × 10−5
+20
+40
+40
+50
+50
+50
+𝑘𝑥2
+4.10 × 10−3
+45
+40
+40
+50
+50
+50
+𝑘𝑦2
+1.51 × 10−2
+45
+40
+40
+50
+50
+50
+𝑘𝛼
+3.145
+45
+40
+40
+50
+50
+50
+𝑘hor
+7.245
+45
+50
+40
+50
+50
+50
+𝑘𝑝1
+4.99 × 10−5
+45
+40
+40
+50
+50
+50
+𝑘𝑝2
+3.78 × 10−5
+45
+40
+40
+50
+50
+50
+𝑘𝑝3
+4.82 × 10−5
+45
+40
+40
+50
+50
+50
+𝑘𝑝4
+3.83 × 10−5
+45
+40
+40
+50
+50
+50
+𝐽𝑥
+−0.89
+50
+40
+40
+50
+50
+50
+𝑘𝑞1
+2.05 × 10−5
+45
+40
+40
+50
+50
+50
+𝑘𝑞2
+2.46 × 10−5
+45
+40
+40
+50
+50
+50
+𝑘𝑞3
+2.02 × 10−5
+45
+40
+40
+50
+50
+50
+𝑘𝑞4
+2.57 × 10−5
+45
+40
+40
+50
+50
+50
+𝐽𝑦
+0.96
+50
+50
+40
+50
+50
+50
+𝑘𝑟1
+3.38 × 10−3
+45
+40
+40
+50
+50
+50
+𝑘𝑟2
+3.38 × 10−3
+-
+40
+40
+50
+50
+50
+𝑘𝑟3
+3.38 × 10−3
+-
+40
+40
+50
+50
+50
+𝑘𝑟4
+3.38 × 10−3
+-
+40
+40
+50
+50
+50
+𝑘𝑟5
+3.24 × 10−4
+45
+40
+40
+50
+50
+50
+𝑘𝑟6
+3.24 × 10−4
+-
+40
+40
+50
+50
+50
+𝑘𝑟7
+3.24 × 10−4
+-
+40
+40
+50
+50
+50
+𝑘𝑟8
+3.24 × 10−4
+-
+40
+40
+50
+50
+50
+𝐽𝑧
+−0.34
+50
+50
+40
+50
+50
+50
+𝜔min
+341.75
+20
+40
+40
+50
+50
+50
+𝜔max
+3100.00
+15
+33
+30
+30
+30
+40
+𝑘
+0.50
+45
+50
+40
+50
+50
+50
+𝜏
+0.025
+30
+50
+40
+50
+50
+55
+PPO config
+activation
+tanh
+tanh
+relu
+tanh
+relu
+relu
+layers 𝜋
+3
+3
+3
+3
+3
+3
+neurons 𝜋
+64
+64
+64
+64
+64
+64
+layers 𝑉
+3
+3
+3
+3
+3
+3
+neurons 𝑉
+256
+256
+64
+256
+64
+64
+ent coef
+0.003
+0.005
+0.003
+0.003
+0
+0
+Table 1: Training parameters for all models used in the competition.
+7
+
+===== PAGE 8 =====
+A
+M16
+M17
+M18
+M19
+M22
+M23
+15.0
+17.5
+20.0
+22.5
+25.0
+27.5
+30.0
+Completion Time [s]
+Completion Times per Model
+Real Flight
+Simulation
+G&CNet
+M16
+M17
+M18
+M19
+M22
+M23
+number of trials
+100
+100
+100
+100
+100
+100
+successful completions
+94
+86
+86
+100
+98
+100
+success rate [%]
+94.0
+86.0
+86.0
+100.0
+98.0
+100.0
+mean completion time [s]
+17.60
+18.00
+20.11
+20.17
+22.16
+23.79
+fastest [s]
+13.84
+14.91
+16.21
+16.72
+18.42
+20.19
+average speed [m/s]
+19.44
+18.83
+17.05
+16.90
+15.39
+14.25
+max speed [m/s]
+30.79
+28.34
+32.22
+26.42
+25.26
+23.75
+Simulation
+ (30% randomization)
+G&CNet
+M16
+M17
+M18
+M19
+M22
+M23
+number of trials
+4
+7
+12
+7
+9
+43
+successful completions
+1
+5
+8
+5
+7
+38
+success rate [%]
+25.0
+71.4
+66.7
+71.4
+77.8
+88.4
+mean completion time [s]
+16.56
+17.28
+18.76
+19.56
+22.03
+23.69
+fastest [s]
+16.56
+17.12
+18.57
+19.28
+21.63
+22.75
+average speed [m/s]
+20.02
+19.13
+17.86
+17.21
+15.58
+14.44
+max speed [m/s]
+26.62
+25.09
+28.23
+23.48
+20.88
+20.05
+Real Flights
+B
+10
+20
+30
+40
+50
+60
+70
+80
+90
+x [m]
+25
+20
+15
+10
+5
+y [m]
+t0=0.80s
+t1=1.70s
+t2=2.47s
+t3=3.26s
+t4=4.14s
+t5=5.70s
+t6=6.30s
+t7=7.12s
+t8=7.92s
+t9=8.64s
+Drone Trajectory M16
+0
+2
+4
+6
+8
+Time (s)
+15
+10
+5
+0
+5
+F [m/s2]
+t0
+t1
+t2
+t3
+t4
+t5
+t6
+t7
+t8
+t9
+Fx
+0
+2
+4
+6
+8
+Time (s)
+20
+0
+20
+t0
+t1
+t2
+t3
+t4
+t5
+t6
+t7
+t8
+t9
+Fy
+0
+2
+4
+6
+8
+Time (s)
+100
+50
+0
+t0
+t1
+t2
+t3
+t4
+t5
+t6
+t7
+t8
+t9
+Fz
+measured
+nominal model
+(±30%)
+0
+2
+4
+6
+8
+Time (s)
+500
+0
+500
+M [rad/s2]
+t0
+t1
+t2
+t3
+t4
+t5
+t6
+t7
+t8
+t9
+Mx
+0
+2
+4
+6
+8
+Time (s)
+400
+200
+0
+200
+t0
+t1
+t2
+t3
+t4
+t5
+t6
+t7
+t8
+t9
+My
+0
+2
+4
+6
+8
+Time (s)
+50
+25
+0
+25
+50
+t0
+t1
+t2
+t3
+t4
+t5
+t6
+t7
+t8
+t9
+Mz
+0
+2
+4
+6
+8
+Time (s)
+1000
+2000
+3000
+4000
+ [rad/s]
+t0
+t1
+t2
+t3
+t4
+t5 t6
+t7
+t8
+t9
+1
+0
+2
+4
+6
+8
+Time (s)
+t0
+t1
+t2
+t3
+t4
+t5 t6
+t7
+t8
+t9
+2
+0
+2
+4
+6
+8
+Time (s)
+t0
+t1
+t2
+t3
+t4
+t5 t6
+t7
+t8
+t9
+3
+0
+2
+4
+6
+8
+Time (s)
+t0
+t1
+t2
+t3
+t4
+t5 t6
+t7
+t8
+t9
+4
+5
+10
+15
+20
+25
+Speed [m/s]
+Figure 2: (A) G&CNet completion times: real flights versus simulation. (B) Fastest lap trajectory
+top view (M16) and the corresponding measured forces, moments, and actuator outputs versus the
+nominal model.
+8
+
+===== PAGE 9 =====
+between the expected observation of the world with the actual observation of the world. This
+prediction error, which is termed “innovation” in the control systems literature, is what leads state
+corrections in Kalman filters. Whereas typically this innovation is only used for correcting the state,
+one can actually also use it to optimize any part of the involved models and parameters. Suppose
+that we have two sets of state estimation filter parameters, Θ1 and Θ2, capturing aspects such as a
+drone’s dynamics and its sensor properties (e.g., noise variance). If Θ1 = Θ∗, i.e., it corresponds
+to the true dynamics and sensor properties, then we expect to have a smaller accumulated filtering
+innovation than when filtering the state with Θ2 ≠Θ∗. This enables, for instance, evolutionary
+algorithms to optimize parameters like the variances of the different sensor measurements (42), by
+minimizing the innovation over a given set of flight data.
+Although we did investigate the use of the filter’s accumulated absolute innovation, we converged
+on a related but more sensitive metric that better captures long-term prediction quality, namely the
+correspondence between the expected racing gate pixels and the actually observed racing gate pixels
+in the gate segmentation images. Specifically, we use the state estimate together with the flight plan
+(map of the drone racing gates) to re-project gate masks in the image, and compare them with the
+actual observed gate segmentation with the help of the Intersection over Union (IoU). We then take
+the average of the IoU over one or more flights. This method can be used to assess the impact
+of changing any parameter in the state estimation pipeline, ranging from various parameters used
+in the acceptance of corner measurements to drone dynamics parameters. A higher resulting IoU
+indicates an improvement in the resulting state estimation.
+Besides the evaluation of code changes, we also used the IoU in an offline optimization process.
+Although it can, in principle, optimize any parameter, we mainly used the method for the estimation
+of the extrinsic camera calibration parameters. Due to the flexible TPU camera mount, the angular
+offsets of the camera to the drone’s body would regularly change, for instance, after any impact,
+modification or repair of the drone. The calibration setup present at the competition did not
+allow for a highly precise extrinsic calibration. However, over an entire flight, the onboard gate
+segmentation images provided enough evidence for the fine-tuning of these vital parameters. Hence,
+after a crash or repair, we flew the drone through the track with one of our safer networks, and
+subsequently optimized the camera extrinsic angles with the help of this IoU method. We used
+Bayesian optimization (43), since this allowed good results with limited samples - obeying the
+strict timing of the drone racing competition.
+Fig. 3 shows the functioning of the mask-based camera extrinsics optimization method, applied
+both in simulation (top) and on real flight data (bottom). In the simulation experiment, we initialized
+the camera extrinsics with a 2-degree error relative to ground truth (for all angles). On the top left,
+the segmented gate (red) and the re-projected gate (white) do not fully overlap, yielding an average
+IoU of 0.83. After optimization with 40 iterations, the overlap improves significantly (average IoU
+0.91), and the estimated extrinsics (1.9, 54.6, 2.3) are within 1◦of the ground truth (2, 55, 2).
+At the bottom of the figure, we applied the same method to real race data. Here, we take the
+9
+
+===== PAGE 10 =====
+A
+est: ( =0.0, =53.0, =0.0) 
+ gt: ( =2.0, =55.0, =2.0)
+IoU=0.83
+SIL Image (Before)
+est: ( =1.9, =54.6, =2.3) 
+ gt: ( =2.0, =55.0, =2.0)
+IoU=0.91
+SIL Image (After)
+50.0
+52.5
+55.0
+57.5
+ (degrees)
+0.3
+0.4
+0.5
+0.6
+0.7
+Average IoU
+SIL: IoU vs Pitch Angle
+40 iterations
+B
+est: ( =-3.4, =53.9, =-4.5) 
+ kalibr: ( =-1.4, =51.9, =-2.5)
+IoU=0.64
+Real Image (Before)
+est: ( =-0.8, =51.9, =-2.1) 
+ kalibr: ( =-1.4, =51.9, =-2.5)
+IoU=0.78
+Real Image (After)
+50.0
+52.5
+55.0
+57.5
+ (degrees)
+0.3
+0.4
+0.5
+0.6
+0.7
+Average IoU
+Real: IoU vs Pitch Angle
+Iterations
+Best IoU
+Original IoU
+40 iterations
+Figure 3: Self-supervised refinement from onboard data only using mask-based extrinsic optimiza-
+tion. (A) Camera extrinsics optimization in the Software In the Loop (SIL) simulator. The estimated
+extrinsics align within ≈0.5◦of ground truth in only 40 steps optimizing a single log. (B) Result
+of the self-supervised refinement applied to camera extrinsics optimization on real flight data for
+only 40 steps.
+10
+
+===== PAGE 11 =====
+extrinsics estimated by Kalibr3 (44) as comparison. The initial estimate (−3.4, 53.9, −4.5) deviates
+from the calibration (−1.4, 51.9, −2.5) (again 2 degrees offset per angle) and the overlap with
+the segmented gate is poor (average IoU 0.64). After 40 optimizer calls, the estimated extrinsics
+(−0.8, 51.9, −2.5) align much better with the Kalibr result, and the average IoU improves to 0.78.
+This demonstrates that the optimization script can recover accurate extrinsics both in simulation
+and with real flight images, within about 1◦error. To test robustness, we ran this optimization for
+ten different single simulated flights with random U(−2◦, 2◦) perturbations in camera extrinsics.
+The mean absolute errors of the optimized estimates were:
+Pitch 0.14◦(𝜎= 0.09),
+Roll 0.49◦(𝜎= 0.20),
+Yaw 0.71◦(𝜎= 0.28)
+indicating sub-degree accuracy across runs.
+IMU saturation
+The combination of an aggressive reinforcement learning (RL) controller capable of producing
+thrusts of up to 7𝑔, structural vibrations, and noise of the accelerometer led to reaching the
+accelerometer limit of 16𝑔. Upon saturation, the accelerometer provided measurements with some-
+times extreme errors that quickly led to divergence in the IMU-based Kalman filter state, resulting
+in multiple crashes. This primarily occurred during the Split-S maneuver, but also after gate 1
+in the second lap, where we make a sharp turn with high velocity. To address this issue, we im-
+plemented a model-based acceleration prediction mechanism specifically activated during IMU
+saturation events. When the discrepancy between the measured accelerations and the drone’s dy-
+namic model-based estimates exceeds a predefined threshold, the Kalman filter incorporates these
+model-predicted accelerations instead of the saturated sensor readings. Additionally, we inflated the
+Kalman filter’s uncertainty in both position and attitude states during such events to rely more on
+visual sensor measurements, thereby ensuring stable and accurate state estimation during aggressive
+flight maneuvers.
+Fig. 4a illustrates a trajectory segment where the drone crashed into the bottom gate of a Split-S
+maneuver due to IMU saturation in the body-z axis. The red trajectory represents state predictions
+derived from a Kalman filter (KF) using IMU data exclusively for the prediction step. The green
+trajectory shows state predictions from a Kalman filter that uses model-based acceleration estimates
+during IMU saturation. The model-corrected Kalman filter accurately predicts the trajectory of the
+drone, clearly indicating the imminent crash into the gate.
+The adjacent acceleration plot compares the modeled thrust (green) and the measured IMU
+acceleration in the z-direction (red). Between timestamps 𝑡1 and 𝑡2, significant discrepancies are
+evident due to IMU saturation.
+The bottom row shows gate reprojections: green indicates estimates from the model-corrected
+KF, and red indicates estimates from the IMU-predicted KF. Accurate state estimation is confirmed
+3https://github.com/ethz-asl/kalibr
+11
+
+===== PAGE 12 =====
+when the re-projected gates align closely with the actual gate positions in the images (purple). This
+visualization demonstrates that incorporating model-based predictions significantly improves the
+state estimate during aggressive maneuvers, such as the Split-S.
+The controller that secured victory in the AI Grand Challenge, M17, achieved an overall success
+rate of 5 out of 7 flights. The two crashes were caused by IMU saturation. In fact, the IMU-only
+prediction resulted in 2 successful flights and 2 crashes, corresponding to a 50% success rate.
+In contrast, incorporating model-based correction during IMU saturation led to a success rate of
+100%, with all remaining 3 out of 3 flights successfully completed, on top of correctly measuring
+the crash in the previously failed logs.
+Camera interference
+The drone designed by the organizers originally featured long MIPI cables for the camera connec-
+tion. These cables were prone to bending under high thrust loads and occasionally came into contact
+with other hardware components, like the high noise SSD, resulting in electromagnetic interference.
+As illustrated in Fig. 4b, this led to substantial image corruption that primarily occurred during
+periods of high acceleration in the z-axis. Across 10 recorded flights, between 8% and 75% of
+captured images were corrupted. Two flights ended in crashes: one due to complete camera failure
+mid-flight, and another following a flight in which 75% of the images were corrupted. In the latter
+case, the drone flew more than 25 m without valid images, successfully passing through one gate
+but crashing into a second gate, as shown in the right image of Fig. 4b.
+Although the hardware problem was later solved, MonoRace can address this type of problem
+thanks to its incorporated fail-safe strategies. First, the gate segmentation network does not find
+gates in the corrupted parts of the frames (Fig. 4b.3). Next, a RANSAC-based outlier rejection
+matches the 2D affine transformation between priors to corner candidates to reject erroneous
+corners (Fig. 4b.2). Finally, our KF also filters out measurements that deviate too much from the
+predicted state, based on the uncertainty level of the Kalman Filter (Fig. 4b.4). Combined, this
+allowed the drone to survive most of the interference, while still refining the position with any
+occasional good frame.
+DISCUSSION
+In this work,wehavepresentedMonoRace:afullyonboard,monocular,rolling-shutterperception-
+control pipeline for autonomous drone racing that won the April 2025 Abu Dhabi Autonomous
+Drone Racing Competition (A2RL), outperforming all competing AI teams and three world cham-
+pion FPV pilots in direct knockout heats. On the competition track, the vehicle reached a maximum
+speed of 28.23 m/s, which, to our knowledge, is the fastest fully onboard, autonomous flight re-
+ported to date. For context, (2) reports 22 m/s on a different 30 × 30 × 8 m track (20); our results
+were obtained on a 76 × 18 × 5.4 m track, using a monocular CMOS camera, a saturating IMU and
+no external aids at any stage.
+12
+
+===== PAGE 13 =====
+A
+Saturated IMU
+Model Corrected
+1
+2
+3
+4
+5.50
+5.75
+6.00
+6.25
+6.50
+6.75
+7.00
+7.25
+Flight Time [s]
+80
+60
+40
+20
+0
+20
+40
+60
+Acceleration [m/s^2]
+Crash
+IMU saturation
+Modeled Thrust
+IMU Acceleration z
+1
+2
+3
+4
+Flight Time: 5.85s
+Flight Time: 6.24s
+Flight Time: 6.57s
+Flight Time: 6.74s
+B
+Non Corrupted Frames
+1
+2
+3
+4
+60
+40
+20
+0
+Measured acceleration in body z-axis [m/s2]
+Figure 4: Onboard sensor data corruption. (A) Comparison of the accelerometer-based versus
+model-based predicted trajectories, thrust and gate reprojections during a split-S with accelerometer
+saturation. (B) Successful dual lap completion despite 50% image corruption (left) and single lap
+completion with 75% image corruption from camera interference-caused purple horizontal bars,
+outdated top pixels and vertically shifted parts of the image.
+13
+
+===== PAGE 14 =====
+A key element is the Guidance-and-Control Network (G&CNet) that directly outputs motor
+commands, paired with vision-based state estimation. Extensive domain randomization helped
+bridge the simulation-reality gap at high speeds where aerodynamic effects are less predictable (45).
+By bypassing intermediate control loops, the G&CNet achieved a very low end-to-end latency; the
+controller operated at 500 Hz with full throttle authority, allowing the motor commands to change
+from 0-100% in 2 ms.
+The monocular visual state estimator proved robust to camera interference and IMU saturation.
+The drone successfully completed the full track with 50% of the frames being corrupted. During
+periods of high 𝑔loading and structural vibration that caused IMU saturation, we replaced measured
+accelerations with model predictions, which stabilized the estimator.
+Although the proposed drone racing approach set a new milestone, several improvements are
+still possible. First, the vision and control remain decoupled. On the one hand, this results in a
+larger necessity for reward shaping, e.g., including an explicit penalty for not looking at the gates.
+On the other hand, the control network expects perfect state estimation, while the estimated state is
+always uncertain to a given extent. A possible solution avenue is to perform end-to-end learning.
+Second, the vision pipeline heavily relies on the rectangular shape of the gates for both the corner
+detection and the localization relative to the gate. In contrast, humans can easily adapt to different
+gate shapes, with no training necessary. In order to deal with different gate shapes, one could
+train a neural network to directly map an image to relative gate poses. It would be straightforward
+to artificially generate a dataset for this end. However, refinement in the real world without any
+available ground-truth is less evident. The mask reprojection idea could perhaps be used to retrieve
+the ground truth relative positions needed for such refinement. Third, the proposed approach does
+not yet detect and avoid other drones on the track. This did not hamper its performance in the
+human vs. AI tournament, but it did result in a crash during the multi-AI event, in which four AI
+drones flew the track at the same time. In that event, our drone took off first, flying fast, but then
+had to double the other drones. Without drone detection and avoidance, it flew into the drone of
+another team, resulting in a 3rd place in that event. The main challenge here will be to detect and
+avoid other drones, while not adding too much computational effort and complexity to the vision
+and control pipeline.
+Although the proposed approach focuses on agile flight for drone racing, it will have a much
+broader impact. The proposed guidance and control neural network is small enough to comfortably
+run on a microcontroller and still approximate time-optimal flight. The required computation time
+for this is a fraction of traditional pipelines that first plan trajectories and then attempt to execute
+them with the help of online guidance and control. The current study illustrates that G&CNets have
+the potential to unlock optimal control for even the smallest and cheapest robots.
+In this article, the application is FPV drone racing, an e-sports in which drones may play a
+similar role in the future as chess programs play in the board game of chess today: to assist human
+players in training and unlocking novel moves and strategies that have not yet been thought of by
+human beings. Further generalizing the approach away from drone-race-specific elements, such as
+14
+
+===== PAGE 15 =====
+racing gates, will allow for many more real-world applications. Of course, the extremely fast flight
+speeds immediately suggest military applications, where fast flight has not only offensive but also
+defensive utility. However, we hope and expect the main application to lie in the societal domain;
+Currently, fully autonomous drones are typically still rather slow, which means that they fly at
+speeds that are sub-optimal for energy usage. Slight changes to the reward functions can enable
+smooth and swift flight, with the ability to adapt speed to the requirements of the environment
+and the mission. This will, in general, allow drones to perform longer-range and duration missions,
+while slowing down when safety requires it.
+MATERIALS AND METHODS
+Overview
+Here, we provide a brief overview of the proposed approach. A high-level summary of the method is
+illustrated in Fig. 5. We introduce hardware, the state-estimation algorithm, and the reinforcement-
+learning-based control strategy. A more detailed explanation of each component is provided in the
+Perception and Control sections.
+The drone uses a custom carbon fiber frame designed by the competition organizers and has
+a total mass of 966 g. Its sensor suite consists of a monocular rolling-shutter camera with a wide
+field of view (155° horizontal × 115° vertical), and an IMU integrated into the flight controller. The
+IMU provides accelerometer measurements at 1000 Hz and gyroscope measurements at 2000 Hz.
+All computation is performed onboard, using an NVIDIA Jetson Orin NX as the main processing
+unit.
+Our state estimation approach begins by capturing images of 820 × 616 at 90 Hz, which are
+adaptively cropped and resized to 384×384 based on the predicted gate locations. The resulting crops
+are processed by our gate-segmentation model, GateNet. From the resulting segmentation masks,
+our gate-specific corner detector, QuAdGate, extracts gate edges and computes their intersections
+to accurately localize gate corners. After corner detection, we apply homography-based outlier
+rejection between the detected corners and the expected corner projections derived from the prior
+state estimate. Finally, we estimate the drone’s pose using a Perspective-n-Point (PnP) solution
+combined with attitude estimates from the Extended Kalman Filter (EKF). The pose estimates from
+visual processing are then fused with high-rate IMU data in an EKF to ensure robust and accurate
+state estimation even during aggressive flight maneuvers. Due to the high 𝑔-loads and structural
+vibrations, the accelerometer saturates. To mitigate this, we employ a dynamic drone model to
+detect IMU saturation and correct the state predictions accordingly.
+Finally, the estimated states are used as an input to a Guidance & Control Network (G&CNet),
+which operates at 500 Hz and directly outputs motor commands. This light neural network runs on
+the flight controller itself, which is equipped with an STM32H743 ARM processor (480 MHz). The
+15
+
+===== PAGE 16 =====
+Arducam IMX219 
+Camera
+90 Hz
+FoV: 155°(H) x 115°(V)
+Flight Controller
+EKF
+IMU-Model 
+comparison
+Predicted 
+corners
+PnP
+Update
+Delay 
+compensation 
+2000 Hz
+90 Hz
+State 
+integration
+Observation
+RL Simulation
+Prediction
+IMU
+Motor RPM
+Attitude
+Training
+90 Hz
+Adaptive Cropping
+Gate Segmentation
+Corner Detection
+Outlier Rejection
+(De-rotation)
+G&CNet
+64
+64
+64
+20
+4
+Motor commands
+Rewards
+G&CNet
+64
+64
+64
+20
+4
+Jetson Orin NX
+500 Hz
+100 Hz
+Figure 5: Overview of the pipeline and physical location of various elements. An IMX219 camera
+image is grabbed and timestamped on the Orin. Adaptive state-based cropping selects the part
+of the wide-field-of-view image with the best statistics for detecting corners. Gate segmentation
+is performed on the GPU, and subsequently, precise corner detection is performed from edge
+identification. After outlier rejection, the relative pose is computed with respect to the assumed
+gate location. After sensor fusion with delay compensation, the state is sent to the flight controller,
+which runs a 500Hz local state estimation filter and the direct-to-motor neural G&CNet, which was
+trained in RL simulation with randomization and is being executed with zero-shot transfer.
+16
+
+===== PAGE 17 =====
+network distinguishes itself through its real-time responsiveness and adaptability, enabling precise
+trajectory tracking, aggressive maneuvering and instant re-planning in complex, high-speed racing
+environments. It allows faster flight by removing the unpredictability of a traditional inner-loop
+controller near saturation (23). The networks are trained with reinforcement learning in a simplified
+simulation of the race drone that captures the dominant actuator dynamics, aerodynamic forces, and
+moments. Using this simulation together with a reward function, the policy is optimized via PPO to
+complete the track in minimal time. To support robust sim-to-real transfer, broad domain random-
+ization is applied to all model parameters, following the approach of (24). During the competition,
+various combinations of randomization ranges, reward functions, and PPO hyperparameters were
+explored to achieve different speed/robustness trade-offs. The network with the fastest lap time was
+ultimately deployed against the human pilots, which it successfully outperformed.
+Perception
+Adaptive Cropping
+We use a modified camera driver to capture images at 90 Hz with the full field of view of 155◦×115◦
+and a resolution of 820 × 616 pixels. As a first preprocessing step, the images are undistorted. To
+reduce computational load and enable real-time processing on the Jetson Orin NX at 90 Hz, we
+subsequently limit our vision pipeline to a 384 × 384 pixel region (29.2% of the original image).
+For each incoming frame, we predict the expected pixel locations of all gate corners using the
+current state estimate. Based on visibility and distance, we select the image area with the two closest
+visible gates for further processing. Gates are excluded when viewed at an excessively oblique angle
+that would result in strong aspect-ratio distortions; in such situations, even small pixel-level errors
+can induce large errors in the estimated lateral position and heading estimation. We also discard
+gates when the projected center of the gate lies outside the image boundaries.
+If the predicted gate corners are within a 384×384 region of the full-resolution image, we directly
+crop that region. Otherwise, we first resize the image and then crop the 384×384 window around the
+predicted gate location. This adaptive cropping strategy improves computational efficiency while
+minimizing loss of pixel accuracy, ensuring that the perception module receives a consistent input
+resolution regardless of gate distance or viewing angle. It effectively analyzes distant gates with
+original resolution while downscaling large, close gates.
+In Fig. 6C, we compare several strategies for feeding the original image to the 384 × 384 pixel
+network, analyzed on the three fastest successful flights in the competition. The first option is simply
+resizing the full image to 384×384 (‘Resized’) without preservation of the horizontal–vertical aspect
+ratio (AR). ‘Resized fixed AR’ refers to first scaling the image to 511×384, followed by a 384×384
+crop. ‘Center cropping’ directly crops a 384 × 384 region from the center of the original image
+without resizing. ‘Adaptive cropping’ achieves the best performance across all metrics: it obtains
+the highest IoU with the gate segmentation, detects 36% more corners than the simple resized
+approach, and yields 25% more frames with sufficient points for a valid PnP solution. The adaptive
+17
+
+===== PAGE 18 =====
+cropping is able to detect more corners, especially in gates that are far away, as these become too
+small to detect when resizing the image. In contrast, center cropping performs substantially worse
+due to the reduction in the field of view combined with the very high pitch angles. In one of the three
+evaluated flights, this method even led to divergence of the Kalman filter, which in turn explains
+the markedly lower IoU observed for the center-cropping approach.
+GateNet
+Network
+For gate segmentation, we adopt a U-Net–style architecture (46), inspired by prior
+work (30), which we refer to as GateNet. This network consists of an encoder–decoder with skip
+connections from the encoder to the corresponding decoder layer, following the standard U-Net
+design, where channel dimensions are scaled by a factor 𝑓. Each block consists of double 3 × 3
+convolutional layers with batch normalization and ReLU activation functions.
+The network structure first consists of initial double convolutional blocks, denoted as inc.
+downk denotes a max-pooling layer followed by a double convolutional block with 𝑘output
+channels. Before applying downk, the corresponding features are stored as skip connections for
+the decoder. upk denotes a transposed convolution and batch normalization, followed by adding
+the skip connections from the corresponding encoder layer, and then a double convolutional block
+with 𝑘output channels. Finally, outc-1 denotes a 1 × 1 convolution mapping to a single output
+channel and a sigmoid activation function. The resulting network is defined as:
+Encoder
+Decoder
+Outputs
+inc-64/f
+→up4-64/f
+→outc4-1
+↓
+↑
+down1-128/f
+→up3-64/f
+→outc3-1
+↓
+↑
+down2-256/f
+→up2-128/f
+→outc2-1
+↓
+↑
+down3-512/f
+→up1-256/f
+→outc1-1
+↓
+↗
+down4-512/f
+→outc0-1
+GateNet produces five output maps {𝑦0, 𝑦1, 𝑦2, 𝑦3, 𝑦4} at progressively increasing resolutions.
+These multi-scale predictions are supervised using auxiliary losses between each output map and
+appropriately down-scaled ground-truth masks, improving gradient flow and overall segmentation
+accuracy. During deployment, only the highest-resolution output map is used.
+Training setup
+For both training and deployment, we use a resolution of 384 × 384 and 𝑓= 4.
+Before training, Xavier uniform weight initialization (47) is applied. GateNet is trained for 100
+epochs with a base learning rate of 1 · 10−3, reduced by a factor of
+√
+0.1 at epochs 10, 33, 66 and
+90, resulting in a final learning rate of 1 · 10−5. Training is performed with the AdamW optimizer
+18
+
+===== PAGE 19 =====
+and a batch size of 16. Each output map is supervised using a combination of Dice loss and binary
+cross-entropy (BCE) loss:
+L𝑖= LDice(𝑦𝑖, ˆ𝑦𝑖) + 2 · LBCE(𝑦𝑖, ˆ𝑦𝑖)
+Finally, we apply output-specific scaling factors to emphasize higher-resolution predictions:
+Ltot = 4 · L0 + 2 · L1 +
+4
+∑︁
+𝑖=2
+L𝑖.
+Synthetic data
+To reduce the need for manual labeling and improve generalization across different
+track layouts, we generate synthetic data in addition to manually labeled real-world images. In our
+synthetic data pipeline, each gate face is subjected to a series of randomized transformations,
+including scaling, rotation, and perspective warping to simulate varied viewpoints and in-flight
+camera distortions. Once transformed, the gate is composited onto a background image sampled
+from a curated set of representative environments (warehouses, parking lots, empty halls, etc.)
+To increase photometric variability and simulate lighting changes, both gate and background
+images undergo HSV-based color augmentations independently. This includes random shifts in hue,
+saturation, and value to mimic different lighting conditions and material reflectances. Furthermore,
+we introduce image-level noise by applying Gaussian noise with randomly sampled variance across
+images. This noise emulates sensor imperfections like thermal noise (48) together with environ-
+mental artifacts, and contributes to the robustness of the trained model. All augmentation strategies
+were applied in a randomized manner per sample, ensuring a high degree of variation across the
+synthetic dataset (See Fig. 6B). The resulting images form a diverse and richly augmented set that
+helps bridge the domain gap between synthetic and real-world data, and operate the robot in new
+environments without any additional image labeling.
+Data augmentations
+The synthetic and real-world datasets are merged and fed through a unified
+dataloader (in a 3500:500 synthetic to real split) to ensure consistent preprocessing and augmen-
+tation across all samples. During training, each image undergoes randomized affine transforma-
+tions—comprising rotation, translation, and scaling—to enhance spatial variability and viewpoint
+diversity. Additional photometric augmentations are performed in the HSV color space to also vary
+labeled images, introducing random perturbations in hue, saturation, and value to emulate lighting
+variations and material appearance changes.
+To further mimic the visual artifacts encountered during high-speed flight, artificial motion blur
+is applied by convolving each image with a square averaging kernel of random size (5–15 pixels)
+and random orientation. Complementary noise models, including thermal noise and kernel-based
+blurring, are also introduced to replicate sensor noise and lens-induced degradation. These aug-
+mentations, applied stochastically at load time, yield a more diverse and robust training distribution
+that facilitates improved generalization.
+19
+
+===== PAGE 20 =====
+QuAdGate
+To obtain sub-pixel steady corners needed for precise PnP, despite sometimes rounded or incomplete
+gate segmentations, a solution is proposed that exploits the entire gate edge. The algorithm, called
+QuAdGate, extracts inner and outer gate corners from the segmentation masks (See Fig. 6D). It
+detects and matches gate corners by combining the segmentation output with predicted corner
+coordinates (priors) based on state estimation. QuAdGate first uses a line detector to extract
+line segments from the segmentation mask and computes their intersections to identify corner
+candidates. It then matches these candidates to the priors using handcrafted descriptors obtained
+from the segmentation map.
+Corner detection
+The segmentation mask is first derotated using the estimated attitude such that
+the vertical axis in the image matches the up-direction in the world frame. The corner detection
+begins by identifying lines using the OpenCV implementation of the Line Segment Detector
+(LSD) (49), applied to the segmentation masks. In our implementation, the parameters are set to
+scale = 0.8, sigma scale = 0.8, quant = 25.0, and ang th = 30.0. These are chosen to balance
+detecting the majority of lines from the segmentation masks while ensuring that each side of the
+gate is represented by exactly one line to avoid multiple detections. Next, the detected lines are
+extended equally in both directions such that their total length increases by a factor of 5/3. The
+intersections between these extended lines are then computed to determine gate corner candidates.
+By relying on the intersections of the detected lines rather than the extremities of the segmentation
+mask itself, as in De Wagter et al. (30), the accuracy of the corner coordinates is no longer affected
+by rounding or other minor imperfections in the mask.
+Descriptors
+To associate corner candidates with prior gate corners projected from the EKF
+estimate, handcrafted descriptors are extracted from the thresholded segmentation mask. Each
+descriptor captures four pixel values in the local neighborhood of a candidate corner:
+𝑑(𝑝) = [𝑣𝑇𝐿, 𝑣𝑇𝑅, 𝑣𝐵𝑅, 𝑣𝐵𝐿]𝑇
+where 𝑑(𝑝) is the descriptor of corner candidate 𝑝, and 𝑣TL, 𝑣TR, 𝑣BR, 𝑣BL are the corresponding
+pixel values at the top-left, top-right, bottom-right, and bottom-left, respectively. These positions
+are determined by moving 5 pixels along the directions of the intersecting lines. For instance, the
+top-left value is obtained by moving 5 pixels to the left along the horizontal line and 5 pixels up
+along the vertical line. For a top-right outer corner, the resulting prior descriptor is [0, 0, 0, 1]𝑇,
+with 0 representing regions of empty space and 1 marking pixels belonging to the segmentation
+mask.
+Corner matching
+An initial filtering step matches corner candidates to priors. Each candidate is
+first classified by corner type, allowing no discrepancy between the descriptor of a prior and that of
+20
+
+===== PAGE 21 =====
+A
+B
+a
+h
+b
+c
+d
+e
+f
+g
+C
+Resized
+Resized
+fixed AR
+Center
+cropping
+Adaptive
+cropping
+IoU
+0.47
+0.48
+0.36
+0.50
+Detected corners
+19168
+19436
+15437
+26516
+Frames with PnP
+2950
+2913
+2426
+3647
+D
+descriptor 
+coordinates
+detected 
+lines
+corner 
+candidates
+matches
+priors
+accepted 
+corners
+Figure 6: (A) Vision Pipeline Elements. (B) Data augmentation from composited gate (a) and
+representative background. Individual augmentations include (b) HSV-based color augmentation,
+(c) directional brightness gradient, (d) Gaussian blur, (e) additive Gaussian noise, (f) lens distortion,
+and (g) rolling-shutter kernel blur. Combining these augmentations results in (h) fully augmented
+image. (C) Adaptive cropping allows light-weight processing of the most interesting part of the
+image, as illustrated by the best score in terms of IoU, number of accepted corners and ‘frames with
+PnP’ computed for the three fastest successful flights. (D) ‘QuAdGate’ precise corner fitting from
+possibly damaged segmentations based on edge detections. Lines intersections define precise corner
+candidates (blue). Around each candidate, local segmentation values are sampled (clockwise from
+the top-left) to form descriptors (cyan). These descriptors are then used to match candidates with
+the priors (green), yielding the final accepted corners (orange). Even with substantially misplaced
+priors (green), QuAdGate successfully matches them with the correct candidates (orange) while
+rejecting spurious corner candidates (blue).
+21
+
+===== PAGE 22 =====
+a corner candidate. Candidates are further restricted to lie within 100 pixels of the corresponding
+prior. Next, an optimal 2D affine transformation from priors to candidates, constrained to four
+degrees of freedom (translation, rotation, and uniform scaling), is estimated using RANSAC (50) to
+filter out incorrect matches and other outliers. We employ OpenCV’s estimateAffinePartial2D
+with RansacThreshold = 5.0. Lastly, the solution is rejected if the translation in any direction
+exceeds 150 pixels, indicating poor convergence.
+Perspective n Points
+In contrast to (20), who solve a separate PnP problem for each gate, we combine the corners detected
+from multiple gates (two in our case) in a single PnP optimization when possible. This approach
+offers two key advantages over treating each gate independently.
+First, when the 2D–3D correspondences come from gates located at different depths (non-
+coplanar), the variation in spatial configuration improves the ability of PnP to distinguish between
+translation and rotation. This is illustrated in Fig. 7a, where we show in green the reprojection of
+the first two gates using the estimated drone state based on the initial PnP with a different number
+of tracked corners. It can be seen that using even a single corner from a second gate improves
+this reprojection (which corresponds to a more accurate state) and results in a heading estimation
+difference of approximately 2◦. This improvement is particularly important for long tracks, where
+initial heading errors strongly influence state estimation.
+A second important advantage of merging corners from multiple gates in a single PnP opti-
+mization is that it allows PnP to reach its required threshold of at least four points more often.
+For the fastest successful flight, we detected enough corners for PnP 963 out of 1620 frames, of
+which 263 (27%) were multi-gate PnP cases. Among these, only 82 instances had two gates with at
+least four detected corners each, while 181 frames benefited from partial detections. Sparse corner
+detections occur most frequently at distant gates, as the wide camera field of view and limited
+pixel resolution make segmentation and corner detection challenging. In Fig. 7b we show that PnP
+nevertheless benefits from the partial gate corner detections in our three fastest flights. It can be
+seen that including these additional corners from different gates reduces both position and attitude
+errors. The difference is most visible when the distance to the primary gate is large.
+The OpenCV implementation returns the camera position in a world coordinate system by
+combining the relative pose to the gate with the gate’s known world coordinates. The solution
+remains sensitive to geometry, especially at long viewing distances to gates as small rotational
+errors, for instance due to remaining delays combined with fast body rotations, can still result
+in important position errors. Furthermore, when the gate is very close, motion blur degrades the
+quality of gate segmentation, resulting in less reliable corner detections. Lastly, PnP is less reliable
+when using a small number of points. To address this, we only use the full PnP solution when the
+gate distance is within a range of 2 m to 5 m and when a sufficient number of corners (at least six)
+are detected. If one of the two conditions is not met, we instead use the attitude from the Kalman
+22
+
+===== PAGE 23 =====
+A
+: 0.9°
+: 0.1°
+: -16.6°
+x: 7.90m
+y: -21.90m
+z: -0.20m
+: 0.8°
+: -0.4°
+: -18.6°
+x: 8.00m
+y: -21.68m
+z: -0.26m
+B
+0-2
+2-4
+4-6
+6-8
+8-10
+10-12
+12-14
+14-16
+Distance to gate (m)
+0.0
+1.0
+2.0
+3.0
+4.0
+5.0
+6.0
+Position Error (m)
+Position Error w.r.t EKF
+PnP 1 gate
+PnP 2 gates
+De-rotated (2 gates)
+0-2
+2-4
+4-6
+6-8
+8-10
+10-12
+12-14
+14-16
+Distance to gate (m)
+0.0
+5.0
+10.0
+15.0
+20.0
+25.0
+30.0
+Attitude Error (deg)
+Attitude Error w.r.t EKF
+PnP 1 gate
+PnP 2 gates
+C
+20
+40
+60
+80
+X Position (m)
+25
+20
+15
+10
+5
+Y Position (m)
+Flight Direction
+Flight Direction
+Estimated Trajectory
+Measurement Candidates
+PnP EKF Attitude-Based
+Raw PnP
+Figure 7: Analysis of the PnP position and attitude accuracy in function of number of gates, gate
+distance and gate-derotation. (A) PnP heading initialization error depends on the number of gates.
+Even a single point on a second gate improves the reprojection. (B) PnP accuracy statistics for the
+three fastest successful. The accuracy becomes unacceptable for single gates beyond about 5m but
+remains good with derotated double gates. (C) Overview of the measurement candidates for the
+Kalman filter during the fastest successful flight, M16, against Killian Rousseau. When multiple
+gates are in view, the raw PnP becomes visibly better.
+23
+
+===== PAGE 24 =====
+filter state combined with the relative translation (w.r.t. the gate) estimate from PnP to compute
+the drone’s world position. This fallback approach ensures a more accurate position estimation,
+especially for far gates, as shown in the left plot in Fig. 7b, denoted as ”De-rotated (2 gates)”. In
+Fig. 7c, we show the position estimate from OpenCV (Raw PnP) for each frame with a successful
+PnP and the de-rotated EKF Attitude method for our fastest flight. In green, we highlight the
+estimates that were used in our Kalman Filter as measurement candidates. This fallback approach
+ensures a more stable and robust position estimation. Especially far away from the next gate, the
+blue crosses much better represent the drone’s position than the highly noisy orange crosses.
+Since our position estimate is strongly coupled with our (EKF) attitude estimation, several
+measures are needed to feed minimal errors in the state estimation. Therefore, we only update our
+attitude from PnP in three scenarios that provide sufficiently reliable attitude updates:
+1. When the distance to the gate is between 2 m and 5 m, and more than six corners are detected.
+2. When at least two gates are detected, which improves the ability to distinguish between
+translation and rotation, making the PnP attitude estimate reliable enough for attitude updates
+(see right plot in Fig. 7b).
+3. When the drone is stationary (not in flight). In this case, we use the PnP attitude to correct
+for any potential misalignment in the initial pose estimate, particularly in the otherwise
+unobservable drone’s heading.
+State Estimation
+IMU Saturation
+During our high-speed flights, aggressive maneuvers reaching up to 7𝑔, combined with structural
+vibrations and variations in IMU quality across different drones, pushed the accelerometers beyond
+their 16𝑔measurement range. When saturation occurs, the sensor output is not consistently limited
+to ±16𝑔, but often is inconsistent, making such events more difficult to detect. This saturation or
+corruption of accelerometer data caused divergence in the Kalman filter, almost inevitably leading
+to crashes.
+To overcome these sensor limitations and enable higher-speed flight, we implemented an on-
+board algorithm that continuously compares predicted accelerations from a dynamic drone model
+with measured accelerations during all high-speed competition flights. The predicted accelerations
+are derived from the quadcopter model used in our RL simulator, as defined in Equation 6. When
+the difference between the predicted and measured accelerations exceeds a predefined threshold,
+the system switches to using the model-based acceleration predictions for state estimation in the
+Kalman filter.
+To reduce high-frequency noise, the raw IMU accelerations are smoothed with a first-order
+low-pass (exponential moving-average) filter. The identical filter is applied to the model-predicted
+24
+
+===== PAGE 25 =====
+accelerations so that both signals experience the same time delay:
+afilt[𝑛] = 𝛼afilt[𝑛−1] + (1 −𝛼) a[𝑛]
+(1)
+For the IMU saturation detection, we compare the filtered sensor output with the filtered model
+estimate. If the Euclidean norm of their difference exceeds a heuristic threshold 𝜎= 22 m/s2, we
+switch to the model-based predicted accelerations (in all 3 axes) for our state prediction in the KF:
+amodel
+filt
+−aIMU
+filt
+
+2 > 𝜎.
+(2)
+Kalman Filter
+We implement an Extended Kalman Filter (EKF) for fusing IMU measurements with position and
+attitude measurements obtained from the PnP solutions.
+We define the state vector x ∈R16 as:
+x = [𝑥
+𝑦
+𝑧
+𝑣𝑥
+𝑣𝑦
+𝑣𝑧
+𝑞𝑤
+𝑞𝑥
+𝑞𝑦
+𝑞𝑧
+𝑏𝑥
+𝑏𝑦
+𝑏𝑧
+𝑏𝑝
+𝑏𝑞
+𝑏𝑟]⊤
+The control input vector u ∈R6 consists of IMU measurements. As described before, we use the
+modeled acceleration instead of the acceleration measured from the accelerometer in cases where
+the accelerometer saturates.
+u = [𝑎𝑥
+𝑎𝑦
+𝑎𝑧
+𝑝
+𝑞
+𝑟]⊤
+The process noise vector w ∈R12 captures IMU noise and bias drift:
+w = [𝑤𝑥
+𝑤𝑦
+𝑤𝑧
+𝑤𝑝
+𝑤𝑞
+𝑤𝑟
+𝑤𝑏𝑥
+𝑤𝑏𝑦
+𝑤𝑏𝑧
+𝑤𝑏𝑝
+𝑤𝑏𝑞
+𝑤𝑏𝑟]⊤
+The continuous-time process model is given by:
+¤x = f𝑐(x, u, w) =
+
+¤p
+¤v
+¤q
+¤b
+
+=
+
+v
+R(q) [𝑎𝑥−𝑏𝑥−𝑤𝑥
+𝑎𝑦−𝑏𝑦−𝑤𝑦
+𝑎𝑧−𝑏𝑧−𝑤𝑧]⊤+ g
+1
+2q ⊗[0
+𝑝−𝑏𝑝−𝑤𝑝
+𝑞−𝑏𝑞−𝑤𝑞
+𝑟−𝑏𝑟−𝑤𝑟]⊤
+[𝑤𝑏𝑥
+𝑤𝑏𝑦
+𝑤𝑏𝑧
+𝑤𝑏𝑝
+𝑤𝑏𝑞
+𝑤𝑏𝑟]⊤
+
+where:
+• p = [𝑥, 𝑦, 𝑧]⊤is the position in world coordinates,
+• v = [𝑣𝑥, 𝑣𝑦, 𝑣𝑧]⊤is the velocity in world coordinates,
+• q = [𝑞𝑤, 𝑞𝑥, 𝑞𝑦, 𝑞𝑧]⊤is the orientation quaternion,
+• b = [𝑏𝑥, 𝑏𝑦, 𝑏𝑧, 𝑏𝑝, 𝑏𝑞, 𝑏𝑟]⊤are the accelerometer and gyro biases,
+• R(q) is the rotation matrix from body to world frame,
+25
+
+===== PAGE 26 =====
+• g = [0, 0, 𝑔]⊤is the gravity vector,
+• ⊗denotes quaternion multiplication.
+We discretize the process model with forward euler to obtain the discrete state transition model:
+𝒙𝑘+1 = f(𝒙𝑘, 𝒖𝑘, 𝒘𝑘) = 𝒙𝑘+ f𝑐(𝒙𝑘, 𝒖𝑘, 𝒘𝑘) · Δ𝑡𝑘
+The measurement model corresponds to position and orientation estimates obtained from the PnP
+algorithm:
+h(x) = [𝑥
+𝑦
+𝑧
+𝑞𝑤
+𝑞𝑥
+𝑞𝑦
+𝑞𝑧]⊤
+The EKF performs a prediction step for every incoming IMU measurement u𝑘:
+x𝑘+1 = f(x𝑘, u𝑘, 0)
+P𝑘+1 = F𝑘P𝑘F⊤
+𝑘+ L𝑘Q𝑘L⊤
+𝑘
+An update step is performed whenever a new PnP measurement z𝑘= [𝑥, 𝑦, 𝑧, 𝑞𝑤, 𝑞𝑥, 𝑞𝑦, 𝑞𝑧]⊤
+becomes available:
+x𝑘+1 = x𝑘+ K𝑘(z𝑘−h(x𝑘))
+P𝑘+1 = (I −K𝑘H𝑘) P𝑘
+Here:
+• K𝑘is the Kalman gain calculated by K𝑘= P𝑘H⊤
+𝑘
+ H𝑘P𝑘H⊤
+𝑘+ R𝑘
+−1
+• F𝑘= 𝜕f
+𝜕x
+
+x𝑘,w𝑘=0 is the Jacobian of the process model w.r.t the state,
+• L𝑘=
+𝜕f
+𝜕w
+
+x𝑘,w𝑘=0 is the Jacobian of the process model w.r.t. process noise,
+• Q𝑘, R𝑘are the process and measurement noise covariances,
+• H𝑘= 𝜕h
+𝜕x is the measurement Jacobian,
+Accurate sensor fusion in our visual-inertial pipeline requires temporal synchronization between
+the camera and the IMU data. Our system establishes this by employing a timestamping mechanism
+and compensating for transport and processing latencies using pre-calibrated delays. Upon the
+arrival of each image, the correctly timestamped sensor measurements are fused to update a
+state estimate corresponding to the image’s time of capture. To provide the flight controller with
+low-latency pose estimates, this delayed state is propagated forward using all subsequent IMU
+measurements that have not yet been fused. In Software-In-The-Loop (SITL) simulations on the
+A2RL competition track, with simulated delays of 17ms for images and 0.5ms for IMU data, our
+method reduced the RMS trajectory error to 0.103m. This presents a significant improvement over
+26
+
+===== PAGE 27 =====
+the 0.289m error from a baseline approach that naively processes the image-derived pose updates
+with the most recent IMU measurements at their time of arrival.
+The measurement noise of the PnP estimation is modeled as:
+𝜎2
+pos =
+0.02 · 𝑑2
+gate
+𝑁2𝑐· 𝑁𝑔
+(3)
+𝜎2
+quat =
+0.01 · 𝑑2
+gate
+𝑁2𝑐· 𝑁𝑔
+(4)
+Outlier rejection is performed based on the Kalman filter position estimate, its covariance, and
+the number of detected corners. A PnP measurement is accepted if the following condition holds:
+xpos −xPnP
+2 < 16 · 𝑁2
+𝑐· trace(Ppos)
+(5)
+where xpos is the position estimate from the Kalman filter, xPnP is the position estimated from
+PnP, and Ppos is the position covariance matrix from the Kalman filter.
+Control
+We use G&CNets (22) to directly compute low-level motor commands from the predicted states
+provided by the vision pipeline. These networks are trained using Proximal Policy Optimization
+(PPO) in a simulation environment. The following sections detail our reinforcement learning (RL)
+pipeline, which includes a detailed model for the quadcopter (Quadcopter Model), an initialization
+strategy designed to cover a wide range of flight conditions (Initialization), parameter randomization
+to improve sim-to-real transfer (Domain Randomization), the design of our reward function (Reward
+Function), and the policy architecture and training specifics (Policy and Training).
+Quadcopter Model
+To train the neural control policies, we use a simulation model of the quadcopter, similar to the one
+described in (24). The state vector x and control input vector u of the quadcopter are defined as
+follows:
+x = [𝑥
+𝑦
+𝑧
+𝑣𝑥
+𝑣𝑦
+𝑣𝑧
+𝑞𝑤
+𝑞𝑥
+𝑞𝑦
+𝑞𝑧
+𝑝
+𝑞
+𝑟
+𝜔1
+𝜔2
+𝜔3
+𝜔4]⊤
+u = [𝑢1
+𝑢2
+𝑢3
+𝑢4]⊤
+Here, 𝒑= (𝑥, 𝑦, 𝑧) and 𝒗= (𝑣𝑥, 𝑣𝑦, 𝑣𝑧) represent the position and linear velocity of the quadcopter
+in the world frame (North-East-Down, NED, convention), respectively. The unit quaternion 𝒒=
+(𝑞𝑤, 𝑞𝑥, 𝑞𝑦, 𝑞𝑧) represents the orientation, while 𝛀= (𝑝, 𝑞, 𝑟) are the body angular rates. The
+variables 𝝎= (𝜔1, 𝜔2, 𝜔3, 𝜔4) denote the angular velocities of the individual motors. The control
+input u consists of the motor commands applied to each rotor.
+27
+
+===== PAGE 28 =====
+The equations of motion of the quadcopter are defined as:
+¤𝒑= 𝒗
+¤𝒗= 𝑅(𝒒)𝑭+ 𝒈
+¤𝒒= 1
+2𝒒⊗[0
+𝑝
+𝑞
+𝑟]⊤
+¤Ω = 𝑴
+¤𝜔= (𝝎𝒄−𝝎)/𝜏
+Here 𝑅(𝒒) is the rotation matrix from body to world frame and 𝒈= [0, 0, 𝑔]⊤is the gravitational
+acceleration vector. 𝑭= [𝐷𝑥, 𝐷𝑦,𝑇]⊤contains the (specific) thrust and drag forces in the body
+frame. The models for these forces follow previous work (21, 23), but include two extensions
+motivated by data collected at higher flight speeds: a quadratic drag term 𝑣|𝑣|, and additional
+dependencies involving the advance ratio 𝜇and the angle off attack 𝛼(51). These effects become
+increasingly relevant at the high speeds reached with more aggressive policies.
+The resulting expressions for the specific forces are
+𝑭=
+
+−𝑘𝑥𝑣𝐵
+𝑥
+Í4
+𝑖=1 𝜔𝑖−𝑘𝑥2𝑣𝐵
+𝑥|𝑣𝐵
+𝑥|
+−𝑘𝑦𝑣𝐵
+𝑦
+Í4
+𝑖=1 𝜔𝑖−𝑘𝑦2𝑣𝐵
+𝑦|𝑣𝐵
+𝑦|
+−𝑘𝜔(1 + 𝑘𝛼𝛼+ 𝑘hor𝜇) Í4
+𝑖=1 𝜔2
+𝑖
+
+(6)
+Here, v𝐵denotes the velocity v expressed in the body frame. The angle of attack of the propeller
+blade is given by 𝛼, and 𝜇represents the effective advance ratio of the blade. These quantities are
+defined as follows:
+𝛼= tan−1  𝑣𝐵
+𝑧
+𝑟¯𝜔
+
+𝜇= tan−1 𝑣𝐵2
+𝑥+ 𝑣𝐵2
+𝑦
+𝑟¯𝜔
+
+with
+¯𝜔=
+4
+∑︁
+𝑖=1
+𝜔𝑖
+where 𝑟is the propeller radius4, 𝜔𝑖are the individual motor angular velocities, and ¯𝜔is the total
+rotational speed across all four motors.
+The angular acceleration 𝑴= (𝑀𝑥, 𝑀𝑦, 𝑀𝑧) around the body axes are modeled as
+𝑴=
+
+−𝑘𝑝1𝜔2
+1 −𝑘𝑝2𝜔2
+2 + 𝑘𝑝3𝜔2
+3 + 𝑘𝑝4𝜔2
+4 + 𝐽𝑥𝑞𝑟
+−𝑘𝑞1𝜔2
+1 + 𝑘𝑞2𝜔2
+2 −𝑘𝑞3𝜔2
+3 + 𝑘𝑞4𝜔2
+4 + 𝐽𝑦𝑝𝑟
+−𝑘𝑟1𝜔1 + 𝑘𝑟2𝜔2 + 𝑘𝑟3𝜔3 −𝑘𝑟4𝜔4 −𝑘𝑟5 ¤𝜔1 + 𝑘𝑟6 ¤𝜔2 + 𝑘𝑟7 ¤𝜔3 −𝑘𝑟8 ¤𝜔4 + 𝐽𝑧𝑝𝑞
+
+(7)
+Each moment component is expressed as a weighted combination of squared rotor speeds, capturing
+how differential thrust produces roll, pitch, and yaw moments. Gyroscopic coupling terms are also
+included. These terms become increasingly important at high rotational rates due to the drone’s
+elongated mass distribution—with the battery mounted at the front and the Jetson Orin at the
+rear—which introduces inertia asymmetry and makes the coupling terms non-negligible. The
+4𝑟was estimated to be 0.0485775 and is not randomized.
+28
+
+===== PAGE 29 =====
+values of 𝐽𝑥, 𝐽𝑦, and 𝐽𝑧were identified experimentally through a free-fall spinning throw of the
+drone without propellers. In this experiment, the gyroscope directly measures the cross-coupling
+effects, enabling estimation of the inertia-difference terms via linear regression.
+Similar to (24) the steady-state motor response 𝝎𝑐is modeled as
+𝜔𝑐,𝑖= (𝜔max −𝜔min)
+√︃
+𝑘𝑢2
+𝑖+ (1 −𝑘𝑙)𝑢𝑖+ 𝜔min
+The nominal parameter values used in the quadcopter model are listed in Table 1. In simulation,
+these equations of motion are discretized using forward Euler integration with a time step of
+Δ𝑡= 0.01 s.
+Initialization
+To ensure broad coverage of possible flight conditions, we use two initialization schemes: one that
+places the drone on the ground near the first gate, and one that samples uniformly from the full
+flight volume.
+In the ground initialization, the drone’s position is sampled around a nominal starting point
+(8, −22, 0) with uniform noise in the horizontal directions:
+𝑥0, 𝑦0 ∼U(−0.5, 0.5) + (8, −22),
+𝑧0 = 0.
+The drone starts with zero linear and angular velocity:
+𝒗0 = 0,
+𝜙0 = 𝜃0 = 0,
+𝜓0 ∼U
+
+−𝜋
+4, 𝜋
+4
+
++ 𝜓gate,
+𝛀0 = 0,
+𝒖0 = 0
+In the uniform initialization, the drone is randomly placed anywhere in the flight arena:
+𝑥0 ∼U(1, 95),
+𝑦0 ∼U(−27, 1),
+𝑧0 ∼U(−5, 0),
+𝒗0 ∼U(−0.5, 0.5)3,
+𝜙0, 𝜃0 ∼U
+
+−𝜋
+9, 𝜋
+9
+
+,
+𝜓0 ∼U(−𝜋, 𝜋),
+𝛀0 ∼U(−0.1, 0.1)3,
+𝒖0 ∼U(−1, 1)4.
+The target gate is chosen as the nearest gate located ahead of the drone, i.e., with the drone positioned
+behind its plane.
+Domain Randomization
+To improve sim-to-real transfer, we apply parameter randomization at the beginning of each episode.
+The nominal parameters of the A2RL quadcopter are identified using linear regression on high-
+speed flight data (see Table 1). Similar to the approach in (24), we randomize each parameter by
+a specified percentage around its nominal value. The level of randomization is selected based on
+29
+
+===== PAGE 30 =====
+a trade-off between robustness and performance. Table 1 lists the ranges used for the competition
+policies. In all policies except M16, each parameter is sampled independently. For this exception,
+yaw moment model parameters are randomized jointly:
+𝑘𝑟1 = 𝑘𝑟2 = 𝑘𝑟3 = 𝑘𝑟4 ∼U(min, max),
+𝑘𝑟5 = 𝑘𝑟6 = 𝑘𝑟7 = 𝑘𝑟8 ∼U(min, max).
+The corresponding table entries for 𝑘𝑟2–𝑘𝑟4 and 𝑘𝑟6–𝑘𝑟8 are marked with ’–’ to indicate equality
+rather than independent sampling.
+Reward Function
+The reward function balances task completion, flight smoothness, and perceptual robustness. All
+components are defined at each timestep 𝑘. A detailed overview of the parameter values used in the
+expressions of the reward function can be found in Table 1.
+The progress reward encourages movement toward the target gate:
+𝑟prog,𝑘= 𝜆prog min  p𝑘−1 −p𝑔𝑘
+ −
+p𝑘−p𝑔𝑘
+ , 𝑣maxΔ𝑡
+where p𝑘is the drone’s position and p𝑔𝑘the center of the current gate. This type of progress-based
+reward is widely used in reinforcement-learning approaches to drone racing (17,20,23,24,16). To
+encourage safer behavior for slower policies, we cap the maximum achievable progress at 𝑣maxΔ𝑡.
+This constraint limits the effective maximum speed of the policy and discourages overly aggressive
+or unsafe trajectories.
+The gate reward provides a bonus upon successfully passing a gate:
+𝑟gate,𝑘= 𝜆gate
+if gate is passed, otherwise 0.
+The angular rate penalty discourages high angular velocities:
+𝑝rate,𝑘= 𝜆rate ∥𝛀𝑘∥2 .
+The gate offset penalty discourages off-center gate crossings:
+𝑝offset,𝑘= 𝜆offset
+p𝑘−p𝑔𝑘
+
+if gate is passed, otherwise 0.
+The perception penalty encourages the drone to keep the next gate within the forward-facing
+camera’s view:
+𝑝perc,𝑘= 𝜆perc 𝜃cam
+if 𝜃cam > 𝜋/3, otherwise 0,
+where 𝜑is the angle between the optical axis and the center of the next gate.
+The motor penalty discourages large changes in motor commands:
+𝑝Δ𝒖,𝑘= 𝜆Δ𝒖
+4
+∑︁
+𝑖=0
+max (|𝑢𝑖[𝑘] −𝑢𝑖[𝑘−1]| −Δ𝑢thresh, 0) .
+30
+
+===== PAGE 31 =====
+This penalty was introduced after observing that an early policy exhibited highly aggressive bang–
+bang control, switching almost exclusively between minimum and maximum motor commands,
+which led to motor overheating. The low action penalty discourages low actions:
+𝑝𝒖,𝑘= 𝜆𝒖
+4
+∑︁
+𝑖=0
+max(0.5 −𝑢𝑖, 0).
+This penalty was initially added to further reduce bang–bang behavior and was used for one of the
+networks used in competition. However, in practice, the motor penalty proved more effective, and
+it became our primary method for regularizing the control inputs. The crash penalty applies a fixed
+penalty when a collision occurs:
+𝑝crash,𝑘= 𝜆crash
+if collision, otherwise 0.
+The total reward at timestep 𝑘is:
+𝑟𝑘= 𝑟prog,𝑘+ 𝑟gate,𝑘−𝑝rate,𝑘−𝑝offset,𝑘−𝑝perc,𝑘−𝑝Δ𝒖,𝑘−𝑝𝒖,𝑘−𝑝crash,𝑘.
+Collision detection and gate passing
+In simulation, the drone is modeled as a point mass. The gate’s inner size varies during training
+and is denoted by 𝑔size, while the outer size is fixed at 2.7 m and the gate thickness at 𝑔thickness. All
+gates share the same inner size, except during the training of policy M16, where gates 2 and 6 were
+reduced to 0.45 m. Additionally, the gate thickness was reduced to 0.8, m for policy M16.
+A gate collision is registered when the drone intersects the gate’s collision box or crosses the
+gate plane outside the inner square opening (i.e., more than 𝑔size/2 from the center along either
+axis). A ground collision occurs when 𝑧< −ℎground while the drone’s speed exceeds 𝑣ground. An
+out-of-bounds event occurs when 𝑥∉[1, 95] or 𝑦∉[−27, 1], or when the angular velocity exceeds
+1700 deg/s.
+In the reinforcement learning setup, an episode is terminated whenever a gate collision or an
+out-of-bounds event occurs.
+Policy and Training
+The selected neural policy is a three-layer fully connected network with ReLU activation functions
+and 64 neurons per layer (See Fig 5). The policy takes in 24 observations, including the quadcopter’s
+state and information about current and future gates, similar to prior work (24):
+𝒙obs = [ 𝒑𝑔𝑖, 𝒗𝑔𝑖, 𝚽𝑔𝑖, 𝛀, 𝝎, 𝒑𝑔𝑖𝑔𝑖+1, 𝜓𝑔𝑖𝑔𝑖+1]𝑇
+Here, 𝑔𝑖denotes the reference frame of the 𝑖-th gate. The vector 𝒑𝑔𝑖is the position in the current
+gate frame, 𝒗𝑔𝑖the velocity, 𝚽= (𝜙, 𝜃, 𝜓) the Euler angles, 𝛀the angular velocity in the world
+31
+
+===== PAGE 32 =====
+frame, and 𝝎the angular velocity in the body frame. The components 𝒑𝑔𝑖𝑔𝑖+1 and 𝜓𝑔𝑖𝑔𝑖+1 represent the
+relative position and yaw angle of the next gate, expressed in the current gate frame.
+Although the simulator uses quaternions internally, we represent orientation using Euler angles
+in the observation vector. The network outputs four motor commands 𝒖.
+The quadcopter model, initialization scheme, domain randomization, and reward function de-
+scribed above are used to construct a custom Gym environment for training. We train the policy using
+the Proximal Policy Optimization (PPO) algorithm (52), implemented via the Stable-Baselines3
+library (53). Table 1 provides an overview of the reward function parameters, collision detection
+settings, PPO training parameters, and domain randomization used for the competition policies.
+32
+
+===== PAGE 33 =====
+References and Notes
+1. H. Moon, et al., Challenges and implemented technologies used in autonomous drone racing.
+Intelligent Service Robotics 12 (2019), doi:10.1007/s11370-018-00271-6.
+2. D. Hanover, et al., Autonomous Drone Racing: A Survey. IEEE Transactions on Robotics 40,
+3044–3067 (2024), doi:10.1109/TRO.2024.3400838.
+3. S. Sun, R. Schilder, C. C. de Visser, Identification of quadrotor aerodynamic model from high
+speed flight data, in 2018 AIAA Atmospheric Flight Mechanics Conference (2018), p. 0523.
+4. M. J. Van Nieuwstadt, R. M. Murray, Real-time trajectory generation for differentially flat
+systems. International Journal of Robust and Nonlinear Control: IFAC-Affiliated Journal
+8 (11), 995–1020 (1998).
+5. D. Mellinger, V. Kumar, Minimum snap trajectory generation and control for quadrotors, in
+2011 IEEE International Conference on Robotics and Automation (2011), pp. 2520–2525.
+6. M. Faessler, A. Franchi, D. Scaramuzza, Differential flatness of quadrotor dynamics subject
+to rotor drag for accurate tracking of high-speed trajectories. IEEE Robotics and Automation
+Letters 3 (2), 620–626 (2017).
+7. E. Tal, S. Karaman, Accurate tracking of aggressive quadrotor trajectories using incremental
+nonlinear dynamic inversion and differential flatness. IEEE Transactions on Control Systems
+Technology 29 (3), 1203–1218 (2020).
+8. P. Ru, K. Subbarao, Nonlinear Model Predictive Control for Unmanned Aerial Vehicles.
+Aerospace 4 (2) (2017), https://www.mdpi.com/2226-4310/4/2/31.
+9. D. Bicego, J. Mazzetto, R. Carli, M. Farina, A. Franchi, Nonlinear Model Predictive Control
+with Enhanced Actuator Model for Multi-Rotor Aerial Vehicles with Generic Designs. Journal
+of Intelligent & Robotic Systems 100 (3-4), 1213–1247 (2020).
+10. C. Liu, H. Lu, W.-H. Chen, An explicit MPC for quadrotor trajectory tracking, in 2015 34th
+Chinese Control Conference (CCC) (2015), pp. 4055–4060.
+11. G. Torrente, E. Kaufmann, P. Foehn, D. Scaramuzza, Data-Driven MPC for Quadrotors. IEEE
+Robotics and Automation Letters 6 (2), 3769–3776 (2021), doi:10.1109/lra.2021.3061307.
+12. A. Romero, S. Sun, P. Foehn, D. Scaramuzza, Model Predictive Contouring Control for Near-
+Time-Optimal Quadrotor Flight. CoRR abs/2108.13205 (2021), https://arxiv.org/abs/
+2108.13205.
+13. A. Romero, R. Penicka, D. Scaramuzza, Time-Optimal Online Replanning for Agile Quadrotor
+Flight. IEEE Robotics and Automation Letters 7 (3), 7730–7737 (2022).
+33
+
+===== PAGE 34 =====
+14. S. Sun, A. Romero, P. Foehn, E. Kaufmann, D. Scaramuzza, A comparative study of nonlinear
+mpc and differential-flatness-based control for quadrotor agile flight. IEEE Transactions on
+Robotics (2022).
+15. D. Hanover, P. Foehn, S. Sun, E. Kaufmann, D. Scaramuzza, Performance, Precision, and
+Payloads: Adaptive Nonlinear MPC for Quadrotors. IEEE Robotics and Automation Letters
+7 (2), 690–697 (2022).
+16. Y. Song, A. Romero, M. M¨uller, V. Koltun, D. Scaramuzza, Reaching the limit in
+autonomous racing: Optimal control versus reinforcement learning. Science Robotics
+8 (82), eadg1462 (2023), doi:10.1126/scirobotics.adg1462, https://www.science.org/
+doi/abs/10.1126/scirobotics.adg1462.
+17. Y. Song, M. Steinweg, E. Kaufmann, D. Scaramuzza, Autonomous drone racing with deep
+reinforcement learning, in 2021 IEEE/RSJ International Conference on Intelligent Robots and
+Systems (IROS) (IEEE) (2021), pp. 1205–1212.
+18. R. Penicka, Y. Song, E. Kaufmann, D. Scaramuzza, Learning minimum-time flight in cluttered
+environments. IEEE Robotics and Automation Letters 7 (3), 7209–7216 (2022).
+19. E. Kaufmann, L. Bauersfeld, D. Scaramuzza, A benchmark comparison of learned control poli-
+cies for agile quadrotor flight, in 2022 International Conference on Robotics and Automation
+(ICRA) (IEEE) (2022), pp. 10504–10510.
+20. E. Kaufmann, et al., Champion-level drone racing using deep reinforcement learning. Na-
+ture 620 (7976), 982–987 (2023), doi:10.1038/s41586-023-06419-4, https://doi.org/10.
+1038/s41586-023-06419-4.
+21. R. Ferede, G. de Croon, C. De Wagter, D. Izzo, End-to-end neural network based optimal
+quadcopter control. Robotics and Autonomous Systems 172, 104588 (2024).
+22. D. Izzo, et al., Optimality principles in spacecraft neural guidance and control. Science Robotics
+9 (91), eadi6421 (2024).
+23. R. Ferede, C. De Wagter, D. Izzo, G. C. de Croon, End-to-end reinforcement learning for time-
+optimal quadcopter flight, in 2024 IEEE International Conference on Robotics and Automation
+(ICRA) (IEEE) (2024), pp. 6172–6177.
+24. R. Ferede, T. Blaha, E. Lucassen, C. De Wagter, G. C. de Croon, One Net to Rule Them
+All: Domain Randomization in Quadcopter Racing Across Different Platforms. arXiv preprint
+arXiv:2504.21586 (2025).
+25. M. Bosello, et al., On Your Own: Pro-level Autonomous Drone Racing in Uninstrumented
+Arenas. arXiv preprint arXiv:2510.13644 (2025).
+34
+
+===== PAGE 35 =====
+26. Y. Xu, G. C. de Croon, CNN-based ego-motion estimation for fast MAV maneuvers, in 2021
+IEEE International Conference on Robotics and Automation (ICRA) (IEEE) (2021), pp. 7606–
+7612.
+27. Y. Xu, G. C. de Croon, CUAHN-VIO: Content-and-uncertainty-aware homography network
+for visual-inertial odometry. Robotics and Autonomous Systems 185, 104866 (2025).
+28. S. A. Bahnam, C. De Wagter, G. C. de Croon, Self-Supervised Monocular Visual Drone Model
+Identification through Improved Occlusion Handling. arXiv preprint arXiv:2504.21695 (2025).
+29. S. Li, M. M. Ozo, C. De Wagter, G. C. de Croon, Autonomous drone race: A computationally
+efficient vision-based navigation and control strategy. Robotics and Autonomous Systems 133,
+103621 (2020).
+30. C. De Wagter, F. Paredes-Vall´es, N. Sheth, G. C. H. E. de Croon, The Sensing, State-Estimation,
+and Control Behind the Winning Entry to the 2019 Artificial Intelligence Robotic Racing
+Competition. Field Robotics 2, 1263–1290 (2022), doi:10.55417/fr.2022042.
+31. I. Geles, L. Bauersfeld, A. Romero, J. Xing, D. Scaramuzza, Demonstrating agile flight from
+pixels without state estimation. arXiv preprint arXiv:2406.12505 (2024).
+32. J. Xing, A. Romero, L. Bauersfeld, D. Scaramuzza, Bootstrapping reinforcement learning with
+imitation for vision-based agile flight. arXiv preprint arXiv:2403.12203 (2024).
+33. A. Romero, A. Shenai, I. Geles, E. Aljalbout, D. Scaramuzza, Dream to Fly: Model-Based
+Reinforcement Learning for Vision-Based Drone Flight. arXiv preprint arXiv:2501.14377
+(2025).
+34. M. Krinner, E. Aljalbout, A. Romero, D. Scaramuzza, Accelerating model-based reinforcement
+learning with state-space world models. arXiv preprint arXiv:2502.20168 (2025).
+35. H. Moon, Y. Sun, J. Baltes, S. J. Kim, The IROS 2016 Competitions [Competitions]. IEEE
+Robotics & Automation Magazine 24 (1), 20–29 (2017), doi:10.1109/MRA.2016.2646090.
+36. P. Foehn, et al., AlphaPilot: autonomous drone racing. Autonomous Robots 46 (2022), doi:
+10.1007/s10514-021-10011-y.
+37. G. C. de Croon, Drone-racing champions outpaced by AI (2023).
+38. C. S´anchez-S´anchez, D. Izzo, Real-Time Optimal Control via Deep Neural Networks: Study
+on Landing Problems. Journal of Guidance, Control, and Dynamics 41 (2016), doi:10.2514/
+1.G002357.
+39. L. LLC, LiveTime Scoring System, https://www.livetimescoring.com/, accessed:
+YYYY-MM-DD.
+35
+
+===== PAGE 36 =====
+40. D. Simon, Optimal state estimation: Kalman, H infinity, and nonlinear approaches (John Wiley
+& Sons) (2006).
+41. K. Friston, Embodied inference and spatial cognition. Cognitive processing 13 (Suppl 1),
+171–177 (2012).
+42. S. Li, C. De Wagter, G. C. de Croon, Unsupervised tuning of filter parameters without ground-
+truth applied to aerial robots. IEEE Robotics and Automation Letters 4 (4), 4102–4107 (2019).
+43. J. Snoek, H. Larochelle, R. P. Adams, Practical bayesian optimization of machine learning
+algorithms. Advances in neural information processing systems 25 (2012).
+44. P. Furgale, J. Rehder, R. Siegwart, Unified temporal and spatial calibration for multi-sensor
+systems, in 2013 IEEE/RSJ International Conference on Intelligent Robots and Systems (IEEE)
+(2013), pp. 1280–1286.
+45. A. Loquercio, et al., Deep Drone Racing: From Simulation to Reality With Domain Random-
+ization. IEEE Transactions on Robotics 36 (1), 1–14 (2020), doi:10.1109/TRO.2019.2942989.
+46. O. Ronneberger, P. Fischer, T. Brox, U-Net: Convolutional Networks for Biomedical Image
+Segmentation. CoRR abs/1505.04597 (2015), http://arxiv.org/abs/1505.04597.
+47. X. Glorot, Y. Bengio, Understanding the difficulty of training deep feedforward neural
+networks, in Proceedings of the Thirteenth International Conference on Artificial Intelli-
+gence and Statistics, Y. W. Teh, M. Titterington, Eds. (PMLR, Chia Laguna Resort, Sar-
+dinia, Italy), vol. 9 of Proceedings of Machine Learning Research (2010), pp. 249–256,
+https://proceedings.mlr.press/v9/glorot10a.html.
+48. I. Brouk, A. Nemirovsky, Y. Nemirovsky, Analysis of noise in CMOS image sensor, in 2008
+IEEE International Conference on Microwaves, Communications, Antennas and Electronic
+Systems (2008), pp. 1–8, doi:10.1109/COMCAS.2008.4562800.
+49. R. Grompone von Gioi, J. Jakubowicz, J.-M. Morel, G. Randall, LSD: a Line Segment Detec-
+tor. Image Processing On Line 2, 35–55 (2012), https://doi.org/10.5201/ipol.2012.
+gjmr-lsd.
+50. M. A. Fischler, R. C. Bolles, Random sample consensus: a paradigm for model fitting with
+applications to image analysis and automated cartography. Commun. ACM 24 (6), 381–395
+(1981), doi:10.1145/358669.358692, https://doi.org/10.1145/358669.358692.
+51. J. Svacha, K. Mohta, V. Kumar, Improving quadrotor trajectory tracking by compensating for
+aerodynamic effects, in 2017 international conference on unmanned aircraft systems (ICUAS)
+(IEEE) (2017), pp. 860–866.
+36
+
+===== PAGE 37 =====
+52. J. Schulman, F. Wolski, P. Dhariwal, A. Radford, O. Klimov, Proximal policy optimization
+algorithms. arXiv preprint arXiv:1707.06347 (2017).
+53. A. Raffin, et al., Stable-Baselines3: Reliable Reinforcement Learning Implementations. Jour-
+nal of Machine Learning Research 22 (268), 1–8 (2021), http://jmlr.org/papers/v22/
+20-1364.html.
+Acknowledgments
+We gratefully acknowledge the many participants of previous races whose dedication and efforts
+laid the foundation for this work. Their contributions created the knowledge base and inspiration
+that made further progress possible. We also sincerely thank ADR and AIRR for their help in
+pushing this field of research. Finally, we would like to thank A2RL and DCL for this opportunity.
+Funding:
+Parts of this work, in particular, the development of the RL-based control, were per-
+formed with the support of ‘SPEAR’ project nr 101119774 under HORIZON-CL4-2022-DIGITAL-
+EMERGING-02-06.
+37
