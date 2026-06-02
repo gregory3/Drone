@@ -94,8 +94,20 @@ class ClassicalGateDetector(GateDetector):
 
     def __init__(self) -> None:
         p = cfg.perception
-        self._hsv_lower = np.array(p.gate_hsv_lower, dtype=np.uint8)
-        self._hsv_upper = np.array(p.gate_hsv_upper, dtype=np.uint8)
+        # Support multiple HSV ranges so we can match red gates (red wraps the
+        # hue boundary, needing low + high ranges) alongside the orange range.
+        # Primary range plus any configured gate_hsv_lower2/3 + gate_hsv_upper2/3.
+        self._hsv_ranges = [(np.array(p.gate_hsv_lower, dtype=np.uint8),
+                             np.array(p.gate_hsv_upper, dtype=np.uint8))]
+        for i in (2, 3, 4):
+            lo = getattr(p, f"gate_hsv_lower{i}", None)
+            hi = getattr(p, f"gate_hsv_upper{i}", None)
+            if lo is not None and hi is not None:
+                self._hsv_ranges.append((np.array(lo, dtype=np.uint8),
+                                         np.array(hi, dtype=np.uint8)))
+        # Kept for backwards compatibility / introspection.
+        self._hsv_lower = self._hsv_ranges[0][0]
+        self._hsv_upper = self._hsv_ranges[0][1]
         self._min_area = p.gate_min_area_px
         self._max_area = p.gate_max_area_px
         self._conf_thresh = p.gate_confidence_threshold
@@ -106,7 +118,9 @@ class ClassicalGateDetector(GateDetector):
         # --- preprocessing ---
         blurred = cv2.GaussianBlur(frame_bgr, (5, 5), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self._hsv_lower, self._hsv_upper)
+        mask = cv2.inRange(hsv, *self._hsv_ranges[0])
+        for lo, hi in self._hsv_ranges[1:]:
+            mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
 
         # Morphological cleanup
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))

@@ -33,7 +33,7 @@ class RecoveryState(Enum):
 
 class RecoveryBehavior:
 
-    SWEEP_DURATION_S = 3.0       # How long to yaw-sweep before advancing
+    SWEEP_DURATION_S = 6.0       # How long to hold + yaw-sweep before advancing
     BLIND_ADVANCE_DURATION_S = 1.5
     ALTITUDE_GAIN_M = 0.2
 
@@ -95,12 +95,12 @@ class RecoveryBehavior:
         elapsed = now - (self._start_t or now)
 
         if self._state == RecoveryState.YAW_SWEEP:
-            # Hover near the last known gate position + climb slightly + yaw sweep
-            if self._last_known_gate_pos is not None:
-                hover_target = self._last_known_gate_pos.copy()
-            else:
-                hover_target = current_pos.copy()
-            hover_target[2] += self.ALTITUDE_GAIN_M
+            # HOLD current position and yaw-sweep to re-find the gate. Do NOT
+            # chase an absolute last-known position: in vision-only flight the
+            # position estimate drifts, so targeting a stale absolute point
+            # flies the drone away. Setting target == current_pos yields ~zero
+            # translation error (robust to that drift); only yaw changes.
+            hover_target = current_pos.copy()
 
             # Reverse sweep direction halfway through
             if elapsed > self.SWEEP_DURATION_S / 2:

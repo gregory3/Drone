@@ -317,11 +317,22 @@ def make_interface(mode: str = "mock", **kwargs) -> SimInterface:
         base = RealSimInterface(**kwargs)
     elif mode == "elodin":
         base = ElodinSimInterface(**kwargs)
+    elif mode == "mavlink":
+        # Imported lazily so the module loads (and tests run) without pymavlink.
+        from drone_sim.mavlink_adapter import MavlinkSimInterface
+        base = MavlinkSimInterface(**kwargs)
     else:
         raise ValueError(
-            f"Unknown sim mode: {mode!r}. Use 'mock', 'real', or 'elodin'."
+            f"Unknown sim mode: {mode!r}. Use 'mock', 'real', 'elodin', "
+            "or 'mavlink'."
         )
     if force_ned:
+        # The AI-GP MAVLink sim is already NED end-to-end; wrapping it would
+        # double-convert. mock/elodin are ENU, so NEDAdapter applies there.
+        if mode == "mavlink":
+            print("[make_interface] --force-ned ignored: the mavlink sim is "
+                  "already NED.")
+            return base
         return NEDAdapter(base, underlying_frame="enu")
     return base
 

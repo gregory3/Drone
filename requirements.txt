@@ -5,3 +5,4 @@ pytest
 matplotlib
 pyyaml
 rerun-sdk
+pymavlink        # AI-GP official MAVLink sim adapter (drone_sim.mavlink_adapter)

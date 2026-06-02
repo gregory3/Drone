@@ -43,6 +43,7 @@ from telemetry.logger import FlightLogger, LogFrame, export_run_dataset
 # Flight phases
 # ---------------------------------------------------------------------------
 PHASE_IDLE     = "idle"
+PHASE_TAKEOFF  = "takeoff"
 PHASE_SEARCH   = "search"
 PHASE_APPROACH = "approach"
 PHASE_THROUGH  = "through"
@@ -99,6 +100,11 @@ class AutonomyLoop:
         self._camera_fy = self._camera_fx
         self._camera_cx = cfg.perception.image_width / 2
         self._camera_cy = cfg.perception.image_height / 2
+        # Camera is pitched up by this angle; must be compensated when
+        # reprojecting a gate pixel to a 3D direction, otherwise a level gate
+        # reads as "above" and the drone climbs away from it.
+        self._camera_tilt_rad = np.radians(
+            getattr(cfg.perception, "camera_tilt_deg", 0.0))
 
         # Stats
         self._gates_passed = 0
@@ -109,6 +115,14 @@ class AutonomyLoop:
     def run(self, max_gates: Optional[int] = None) -> None:
         self._sim.connect()
         self._sim.reset()
+        # Real flight controllers (e.g. the AI-GP MAVLink sim) must be armed
+        # before they accept setpoints. arm() is interface-specific. Skip the
+        # manual pre-race arm when the adapter auto-arms — the AI-GP sim only
+        # accepts arming once the race is active, and arming twice (here + at
+        # race start) leaves its FC non-responsive.
+        if hasattr(self._sim, "arm") and not getattr(self._sim, "_auto_arm", False):
+            print("[Main] Arming drone...")
+            self._sim.arm()
         self._start_t = time.time()
 
         print(f"\n[Main] Starting run '{self._logger.run_id}'")
@@ -120,7 +134,7 @@ class AutonomyLoop:
             self._viewer = SimViewer(self._view_window, view_dir)
 
         try:
-            self._phase = PHASE_SEARCH
+            self._phase = PHASE_TAKEOFF
             while True:
                 t0 = time.time()
 
@@ -159,6 +173,20 @@ class AutonomyLoop:
         t_rel = t0 - (self._start_t or t0)
 
         self._gate_passed_this_cycle = False
+
+        # --- takeoff: climb hard off the pad before gate-following begins ---
+        # The sim won't translate until airborne, and the confidence-scaled
+        # speed limit otherwise throttles the climb too much to lift off.
+        if self._phase == PHASE_TAKEOFF:
+            if t_rel < cfg.planning.takeoff_duration_s:
+                self._sim.send_velocity_command(
+                    0.0, 0.0, -cfg.planning.takeoff_climb_mps, 0.0)
+                self._loop_count += 1
+                if self._loop_count % 50 == 0:
+                    print(f"  [{t_rel:6.1f}s] phase=takeoff  climbing off pad")
+                return False
+            self._phase = PHASE_SEARCH
+            self._controller.reset()
 
         # --- observe ---
         obs = self._sim.get_observation()
@@ -244,6 +272,7 @@ class AutonomyLoop:
             best_det=best_det,
             state=state,
             obs=obs,
+            gt=gt,
         )
 
         # --- control ---
@@ -336,7 +365,7 @@ class AutonomyLoop:
         return self._phase == PHASE_COMPLETE
 
     # ------------------------------------------------------------------
-    def _compute_target(self, gate_detected, best_det, state, obs):
+    def _compute_target(self, gate_detected, best_det, state, obs, gt=None):
         """Determine where to fly this cycle. Returns (target_pos, yaw_rate_override)."""
 
         # --- recovery check ---
@@ -379,15 +408,35 @@ class AutonomyLoop:
                     gate_target = through_target
                     self._phase = PHASE_THROUGH
             elif best_det.distance_est_m is not None:
-                # Fall back to vision-based reprojection when no course is available.
+                # Vision-based reprojection when no course is available.
+                # Account for the camera's upward tilt + the drone's live pitch,
+                # otherwise a level gate reads as "above" and we climb away.
                 d = best_det.distance_est_m
                 u, v = best_det.center_px
-                cam_x = (u - self._camera_cx) * d / self._camera_fx
-                cam_y = (v - self._camera_cy) * d / self._camera_fy
-                yaw_rad = np.radians(state.att_deg[2])
-                rel_x = np.cos(yaw_rad) * d - np.sin(yaw_rad) * cam_x
-                rel_y = np.sin(yaw_rad) * d + np.cos(yaw_rad) * cam_x
-                rel_z = -cam_y
+
+                # Pixel offsets -> angles relative to the optical axis.
+                alpha = np.arctan2(v - self._camera_cy, self._camera_fy)  # down +
+                beta = np.arctan2(u - self._camera_cx, self._camera_fx)   # right +
+
+                # Use the drone's measured attitude (legal sensor data) when
+                # available; pitch>0 = nose up in our convention.
+                if gt is not None:
+                    pitch_rad = np.radians(gt.att_deg[1])
+                    yaw_rad = np.radians(gt.att_deg[2])
+                else:
+                    pitch_rad = 0.0
+                    yaw_rad = np.radians(state.att_deg[2])
+
+                # Ray elevation above horizontal = camera tilt + body pitch - pixel offset.
+                elevation = self._camera_tilt_rad + pitch_rad - alpha
+                horiz = d * np.cos(elevation)
+                rel_up = d * np.sin(elevation)
+                body_forward = horiz * np.cos(beta)
+                body_right = horiz * np.sin(beta)
+
+                rel_x = np.cos(yaw_rad) * body_forward - np.sin(yaw_rad) * body_right
+                rel_y = np.sin(yaw_rad) * body_forward + np.cos(yaw_rad) * body_right
+                rel_z = -rel_up
                 gate_center = state.pos + np.array([rel_x, rel_y, rel_z])
                 self._last_gate_pos = gate_center.copy()
 
@@ -503,8 +552,9 @@ class AutonomyLoop:
 def main():
     parser = argparse.ArgumentParser(description="AI Grand Prix autonomy stack")
     parser.add_argument("--mode", default="mock",
-                        choices=["mock", "real", "elodin"],
-                        help="Simulation mode")
+                        choices=["mock", "real", "elodin", "mavlink"],
+                        help="Simulation mode ('mavlink' = official AI-GP "
+                             "FlightSim.exe)")
     parser.add_argument("--elodin-sim-module", default=None,
                         help="Importable Python module for the Elodin rig's "
                              "sim/main.py (e.g. 'sim.main')")

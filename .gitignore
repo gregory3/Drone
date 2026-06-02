@@ -1,6 +1,12 @@
 # Flight logs — can be GB in size; never commit them.
 logs/
 
+# Official AI-GP sim package — multi-GB binaries/zip, never commit.
+PLTR Drone Package/
+
+# Throwaway live-sim diagnostic probes (kept locally under tools/).
+tools/
+
 # Python
 __pycache__/
 *.pyc

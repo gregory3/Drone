@@ -24,9 +24,16 @@ perception:
   temporal_smoothing_miss_tolerance: 2 # Keep last smoothed detection for short dropouts
   detection_max_center_jump_px: 120 # Reject inconsistent detections from history
 
-  # HSV color range for Round 1 highlighted gates (tune in sim)
+  # HSV color ranges for Round 1 highlighted gates (tune in sim).
+  # Primary range = orange. Round-1 gates in the official sim render RED, which
+  # wraps the hue boundary, so two extra ranges (low + high hue) cover red.
+  # First-pass red values — sample a real frame on the rig to nail them.
   gate_hsv_lower: [15, 80, 80]
   gate_hsv_upper: [40, 255, 255]
+  gate_hsv_lower2: [0, 110, 70]      # red, low-hue side
+  gate_hsv_upper2: [10, 255, 255]
+  gate_hsv_lower3: [170, 110, 70]    # red, high-hue side (wrap)
+  gate_hsv_upper3: [179, 255, 255]
 
   # Round 2 / neural detector (YOLO-family, swapped in via config)
   detector_backend: "classical"   # "classical" | "onnx"
@@ -50,6 +57,8 @@ planning:
   recovery_search_yaw_rate: 30.0  # deg/s yaw sweep when gate is lost
   recovery_climb_m: 0.3           # Slight altitude gain during recovery
   recovery_resume_confirm_frames: 2  # Frames of stable detection required to exit recovery
+  takeoff_duration_s: 2.0         # Climb hard off the pad for this long at race start
+  takeoff_climb_mps: 2.5          # Commanded climb rate during takeoff (NED up)
 
 control:
   # PID gains — position loop (outer)
@@ -66,6 +75,18 @@ control:
   max_yaw_rate_dps: 120.0
   control_hz: 50               # Main control loop frequency
 
+  # MAVLink control backend (official AI-GP sim runs ACRO/rate mode, so
+  # velocity setpoints are ignored — must command body rates + thrust).
+  mavlink_control_mode: "attitude"   # "attitude" (ACRO sim) | "velocity" (GUIDED sim)
+  att_tilt_per_mps_deg: 5.0    # desired tilt angle per m/s of demanded body velocity
+  att_rate_kp: 6.0             # body-rate (rad/s) per rad of attitude error
+  att_max_rate_dps: 400.0      # body-rate command clamp
+  hover_thrust: 0.32           # collective thrust to hover (0..1); takeoff threshold ~0.3-0.35 on the AI-GP sim
+  thrust_kp_climb: 0.12        # thrust per (m/s) of desired climb rate (enough to lift off)
+  thrust_kd_climb: 0.08        # thrust damping per (m/s) of actual climb rate
+  thrust_min: 0.1
+  thrust_max: 0.6             # safety cap during tuning (drone is very powerful)
+
 telemetry:
   log_dir: "logs"
   log_level: "DEBUG"           # DEBUG | INFO | WARNING
@@ -77,6 +98,8 @@ telemetry:
 sim:
   host: "127.0.0.1"
   port: 5760
+  mavlink_port: 14550          # AI-GP sim (FlightSim.exe) MAVLink UDP port
+  vision_port: 5600            # AI-GP sim camera JPEG stream UDP port
   connect_timeout_s: 10.0
   step_hz: 50                  # How fast we tick the main loop
   mock_use_course: true         # Use the mock course positions when in mock mode

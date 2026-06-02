@@ -336,6 +336,22 @@ def test_classical_detector_finds_orange_rect():
     assert results[0].confidence > 0.1
 
 
+def test_classical_detector_finds_red_gate():
+    """Round-1 gates render red; the multi-range HSV must catch them."""
+    from perception.gate_detector import ClassicalGateDetector
+    import cv2
+
+    det = ClassicalGateDetector()
+    frame = np.full((480, 640, 3), 80, dtype=np.uint8)
+    # Pure red rectangle (BGR). Red wraps the hue boundary -> needs the
+    # configured red sub-ranges, not just the orange primary.
+    cv2.rectangle(frame, (250, 150), (400, 330), (0, 0, 255), -1)
+
+    results = det.detect(frame)
+    assert len(results) > 0, "Expected a detection on the red gate"
+    assert results[0].confidence > 0.1
+
+
 def test_classical_detector_temporal_smoothing_persists_through_short_dropout():
     from perception.gate_detector import make_detector
     import cv2
