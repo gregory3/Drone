@@ -56,7 +56,8 @@ class AutonomyLoop:
     def __init__(self, mode: str = "mock", run_id: Optional[str] = None,
                  show_view: bool = False, force_ned: bool = False,
                  use_rerun: bool = False,
-                 elodin_sim_module: Optional[str] = None) -> None:
+                 elodin_sim_module: Optional[str] = None,
+                 dump_frames: bool = False, dump_hz: float = 5.0) -> None:
         print("\n" + "="*60)
         print("  AI GRAND PRIX — Autonomy Stack v0.1.0")
         print("="*60)
@@ -111,6 +112,18 @@ class AutonomyLoop:
         self._loop_count = 0
         self._start_t: Optional[float] = None
 
+        # Annotated frame dump (so we can SEE what the drone sees offline).
+        self._dump_frames = dump_frames
+        self._dump_dt = 1.0 / dump_hz if dump_hz > 0 else 0.2
+        self._last_dump_t = 0.0
+        self._frames_dir: Optional[Path] = None
+        self._dump_idx = 0
+
+        # Camera-dead watchdog: abort if frames stay black (sim camera died).
+        self._black_since: Optional[float] = None
+        self._camera_dead_timeout = getattr(cfg.sim, "camera_dead_timeout_s", 2.5)
+        self._camera_dead = False
+
     # ------------------------------------------------------------------
     def run(self, max_gates: Optional[int] = None) -> None:
         self._sim.connect()
@@ -132,6 +145,11 @@ class AutonomyLoop:
         if self._show_view:
             view_dir = Path(cfg.telemetry.log_dir) / self._logger.run_id
             self._viewer = SimViewer(self._view_window, view_dir)
+
+        if self._dump_frames:
+            self._frames_dir = Path(cfg.telemetry.log_dir) / self._logger.run_id / "frames"
+            self._frames_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[Main] Dumping annotated frames → {self._frames_dir}")
 
         try:
             self._phase = PHASE_TAKEOFF
@@ -255,6 +273,22 @@ class AutonomyLoop:
         frame_gray = cv2.cvtColor(obs.image, cv2.COLOR_BGR2GRAY)
         frame_brightness = float(np.mean(frame_gray))
 
+        # Camera-dead watchdog: the AI-GP sim's video stream sometimes stops
+        # after repeated crashes. Black frames forever = blind run. Detect it
+        # fast and abort with a clear message instead of wasting the run.
+        if frame_brightness < 1.0:
+            if self._black_since is None:
+                self._black_since = t0
+            elif (t0 - self._black_since) > self._camera_dead_timeout:
+                print(f"\n[Main] ⚠ CAMERA DEAD — no video for "
+                      f"{self._camera_dead_timeout:.1f}s (all-black frames). "
+                      f"The sim's camera stream stopped; restart FlightSim.exe.\n")
+                self._camera_dead = True
+                self._sim.send_velocity_command(0, 0, 0, 0)
+                return True
+        else:
+            self._black_since = None
+
         monitors = {
             "rpm_mean": rpm_mean,
             "battery_pct": battery_pct,
@@ -353,6 +387,11 @@ class AutonomyLoop:
                                                    gate_detected, confidence):
             self._stop_requested = True
 
+        if self._dump_frames and (t0 - self._last_dump_t) >= self._dump_dt:
+            self._last_dump_t = t0
+            self._dump_frame(obs.image, detections, t_rel, confidence,
+                             ctrl, frame_brightness)
+
         # Print progress every 50 loops
         if self._loop_count % 50 == 0:
             gt = self._sim.get_ground_truth()
@@ -363,6 +402,29 @@ class AutonomyLoop:
                   f"{conf_str}  {pos_str}  dt={loop_dt_ms:.1f}ms")
 
         return self._phase == PHASE_COMPLETE
+
+    def _dump_frame(self, image, detections, t_rel, confidence, ctrl,
+                    brightness) -> None:
+        """Save an annotated FPV frame to logs/<run>/frames for offline review."""
+        if self._frames_dir is None:
+            return
+        frame = self._detector.annotate(image.copy(), detections) \
+            if detections else image.copy()
+        # Crosshair at image centre (where the camera points).
+        h, w = frame.shape[:2]
+        cv2.drawMarker(frame, (w // 2, h // 2), (200, 200, 200),
+                       cv2.MARKER_CROSS, 16, 1)
+        lines = [
+            f"t={t_rel:5.1f}s  phase={self._phase}  gate={self._current_gate_idx}",
+            f"conf={confidence:.2f}  bright={brightness:.0f}",
+            f"cmd v=({ctrl.vx:+.1f},{ctrl.vy:+.1f},{ctrl.vz:+.1f}) yaw={ctrl.yaw_rate:+.0f}",
+        ]
+        for i, ln in enumerate(lines):
+            cv2.putText(frame, ln, (8, 18 + i * 18), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        out = self._frames_dir / f"f{self._dump_idx:05d}.jpg"
+        cv2.imwrite(str(out), frame)
+        self._dump_idx += 1
 
     # ------------------------------------------------------------------
     def _compute_target(self, gate_detected, best_det, state, obs, gt=None):
@@ -567,6 +629,10 @@ def main():
                         help="Stop after N gates (default: run until complete)")
     parser.add_argument("--view", action="store_true",
                         help="Show mock simulator camera view")
+    parser.add_argument("--dump-frames", action="store_true",
+                        help="Save annotated FPV frames to logs/<run>/frames for review")
+    parser.add_argument("--dump-hz", type=float, default=5.0,
+                        help="Frame dump rate when --dump-frames is set (default 5)")
     parser.add_argument("--export", metavar="RUN_ID", default=None,
                         help="Export a completed run's dataset and exit")
     parser.add_argument("--export-out", default=None,
@@ -605,7 +671,8 @@ def main():
     loop = AutonomyLoop(mode=args.mode, run_id=args.run_id,
                          show_view=args.view, force_ned=args.force_ned,
                          use_rerun=args.rerun,
-                         elodin_sim_module=args.elodin_sim_module)
+                         elodin_sim_module=args.elodin_sim_module,
+                         dump_frames=args.dump_frames, dump_hz=args.dump_hz)
     loop.run(max_gates=args.gates)
 
 

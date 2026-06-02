@@ -101,6 +101,7 @@ sim:
   mavlink_port: 14550          # AI-GP sim (FlightSim.exe) MAVLink UDP port
   vision_port: 5600            # AI-GP sim camera JPEG stream UDP port
   connect_timeout_s: 10.0
+  camera_dead_timeout_s: 2.5   # Abort run if camera frames are black this long (sim camera died)
   step_hz: 50                  # How fast we tick the main loop
   mock_use_course: true         # Use the mock course positions when in mock mode
   mock_use_ground_truth: true  # When true, mock sim uses perfect ground truth for state
