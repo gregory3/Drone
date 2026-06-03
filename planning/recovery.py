@@ -43,7 +43,12 @@ class RecoveryBehavior:
         self._last_known_gate_pos: Optional[np.ndarray] = None
         self._sweep_dir = 1.0   # +1 or -1 yaw direction
         self._frames_without_gate = 0
-        self._trigger_frames = cfg.perception.detection_history_frames
+        # Recovery engages after this many consecutive missed frames. Decoupled
+        # from the main loop's stale-detection hold (detection_history_frames),
+        # which is now much shorter; falls back to it if the key is absent.
+        self._trigger_frames = getattr(
+            cfg.perception, "recovery_trigger_frames",
+            cfg.perception.detection_history_frames)
         self._resume_confirm_frames = 0
         self._required_resume_confirm = cfg.planning.recovery_resume_confirm_frames
 

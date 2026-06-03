@@ -88,10 +88,14 @@ class PIDController:
         if speed > speed_limit and speed > 0:
             raw_cmd = raw_cmd / speed * speed_limit
 
-        # Yaw toward gate: simple proportional to lateral error
-        yaw_rate = float(np.clip(raw_cmd[1] * 15.0,
-                                 -cfg.control.max_yaw_rate_dps,
-                                  cfg.control.max_yaw_rate_dps))
+        # Yaw is DECOUPLED from the lateral PID. Tying yaw to raw_cmd[1] (lateral
+        # velocity) made any lateral offset spin the drone, swinging the camera
+        # off the gate -> lost detection -> recovery -> oscillation. Heading is a
+        # perception decision (point the camera at the gate), not a by-product of
+        # lateral position error, so the autonomy loop supplies the real yaw rate
+        # via the perception-aware override (gate pixel offset). Here we emit 0;
+        # callers that want heading hold can leave it untouched.
+        yaw_rate = 0.0
 
         return ControlOutput(
             vx=float(raw_cmd[0]),

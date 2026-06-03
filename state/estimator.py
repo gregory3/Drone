@@ -76,6 +76,14 @@ class DroneStateEstimator:
         self._att_deg = np.zeros(3)         # attitude tracked separately (gyro integration)
         self._gyro_bias = np.zeros(3)       # crude bias estimate
 
+        # Camera intrinsics/extrinsics for projecting a gate pixel + range into
+        # a world-frame position. Without these the vision update assumed the
+        # gate was always dead ahead, which dragged the estimate sideways
+        # whenever the gate was actually off to one side (i.e. during turns).
+        pc = cfg.perception
+        self._camera_fov_deg = float(getattr(pc, "camera_fov_deg", 90.0))
+        self._camera_tilt_rad = np.radians(float(getattr(pc, "camera_tilt_deg", 0.0)))
+
         # Velocity damping (when no control input, slow naturally)
         self._cmd_vel = np.zeros(3)
 
@@ -146,27 +154,43 @@ class DroneStateEstimator:
                             frame_w: int,
                             frame_h: int) -> None:
         """
-        Vision update step. Gate center gives lateral offset; distance
-        gives depth. Together they approximate (x, y, z) of the gate
-        relative to the drone, from which we can update position.
+        Vision update step. Project the gate pixel + range estimate into a
+        world-frame position using the camera model and the current attitude,
+        then correct the filter toward it.
+
+        Geometry mirrors the (rig-validated) reprojection in
+        drone_main._compute_target so both paths agree:
+          - pixel offsets -> angles about the optical axis,
+          - the camera's upward tilt + body pitch lift the ray's elevation,
+          - the heading estimate rotates body-forward/right into the world.
+        The old code set gate_rel_x = distance (always "ahead"), which placed an
+        off-axis gate dead in front and dragged the position sideways in turns.
         """
-        # Normalize image coordinates to [-0.5, 0.5]
-        nx = (gate_center_px[0] - frame_w / 2) / frame_w
-        ny = (gate_center_px[1] - frame_h / 2) / frame_h
+        # Pixel -> angle about the optical axis. fx from horizontal FOV.
+        fx = (frame_w / 2.0) / np.tan(np.radians(self._camera_fov_deg / 2.0))
+        u, v = gate_center_px
+        beta = np.arctan2(u - frame_w / 2.0, fx)    # horizontal, right +
+        alpha = np.arctan2(v - frame_h / 2.0, fx)   # vertical, down +
 
-        # Gate position relative to drone
-        gate_rel_x = distance_m * 1.0           # forward
-        gate_rel_y = -distance_m * nx * 2.0      # lateral (approx)
-        gate_rel_z = -distance_m * ny * 1.5      # vertical
+        roll, pitch, yaw = np.radians(self._att_deg)
 
-        # Absolute gate position estimate
+        # Ray elevation above horizontal = camera tilt + body pitch - pixel-down.
+        elevation = self._camera_tilt_rad + pitch - alpha
+        horiz = distance_m * np.cos(elevation)
+        rel_up = distance_m * np.sin(elevation)
+
+        body_forward = horiz * np.cos(beta)
+        body_right = horiz * np.sin(beta)
+
+        rel_x = np.cos(yaw) * body_forward - np.sin(yaw) * body_right
+        rel_y = np.sin(yaw) * body_forward + np.cos(yaw) * body_right
+        rel_z = -rel_up
+
         cur_pos = self._kf.x[:3, 0]
-        gate_abs = cur_pos + np.array([gate_rel_x, gate_rel_y, gate_rel_z])
+        gate_abs = cur_pos + np.array([rel_x, rel_y, rel_z])
 
-        # We update toward the gate position (not the drone position directly)
-        # — this smooths jitter from detection noise
-        z = gate_abs.reshape(3, 1)
-        self._kf.update(z)
+        # Correct toward the gate position (smooths detection jitter).
+        self._kf.update(gate_abs.reshape(3, 1))
 
     def set_command_velocity(self, vel: np.ndarray) -> None:
         """Feed commanded velocity for the prediction step."""

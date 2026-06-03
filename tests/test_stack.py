@@ -591,7 +591,7 @@ def test_recovery_activates_after_lost_frames():
     rec = RecoveryBehavior()
     pos = np.array([5.0, 0.0, 1.5])
 
-    for _ in range(cfg.perception.detection_history_frames + 1):
+    for _ in range(rec._trigger_frames + 1):
         phase, _, _ = rec.update(gate_detected=False, gate_confidence=0.0,
                                  current_pos=pos, last_gate_pos=None)
 
@@ -605,7 +605,7 @@ def test_recovery_clears_on_gate_found():
     pos = np.array([5.0, 0.0, 1.5])
 
     # Trigger recovery
-    for _ in range(cfg.perception.detection_history_frames + 2):
+    for _ in range(rec._trigger_frames + 2):
         rec.update(gate_detected=False, gate_confidence=0.0,
                    current_pos=pos, last_gate_pos=None)
 
@@ -626,7 +626,7 @@ def test_recovery_requires_stable_detection_to_resume():
     pos = np.array([5.0, 0.0, 1.5])
 
     # Trigger recovery
-    for _ in range(cfg.perception.detection_history_frames + 2):
+    for _ in range(rec._trigger_frames + 2):
         rec.update(gate_detected=False, gate_confidence=0.0,
                    current_pos=pos, last_gate_pos=None)
 
@@ -795,6 +795,111 @@ def test_course_direction_prefers_previous_gate_path():
 # ---------------------------------------------------------------------------
 # Integration: one full control cycle
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Phase 1 bug-fix regression tests
+# ---------------------------------------------------------------------------
+
+def test_yaw_decoupled_from_lateral_pid():
+    """Bug 2: pure lateral position error must not manufacture a big yaw rate.
+
+    Yaw is owned by the perception-aware override upstream; the controller
+    emits no yaw from the lateral PID term."""
+    from control.controller import PIDController
+    ctrl = PIDController()
+    out = ctrl.compute(np.array([0.0, 0.0, 1.5]),
+                       np.array([0.0, 2.0, 1.5]), confidence=1.0)
+    assert abs(out.yaw_rate) < 15.0
+    assert out.vy > 0.0, "still commands lateral velocity to close the offset"
+
+
+def test_through_phase_uses_fresh_detection_vision_only(monkeypatch):
+    """Bug 3: THROUGH must not freeze on a stale last_gate_pos — it should run
+    the normal detection-driven targeting every tick."""
+    import config.loader as loader
+    monkeypatch.setattr(loader.cfg.sim, "mock_use_course", False)
+    from drone_main import AutonomyLoop, PHASE_THROUGH
+    from perception.gate_detector import GateDetection
+
+    loop = AutonomyLoop(mode="mock", run_id="t_through_vis", show_view=False)
+    loop._course = None
+    loop._phase = PHASE_THROUGH
+    stale = np.array([99.0, 99.0, 99.0])
+    loop._last_gate_pos = stale.copy()
+
+    state = loop._estimator.get_estimate()
+    state.pos = np.array([0.0, 0.0, 1.5])
+    det = GateDetection(center_px=(loop._camera_cx, loop._camera_cy),
+                        bbox_px=(0, 0, 100, 100), area_px=20000.0,
+                        confidence=0.9, distance_est_m=2.0)
+
+    target, _ = loop._compute_target(gate_detected=True, best_det=det,
+                                     state=state, obs=None, gt=None)
+    assert not np.allclose(target, stale), \
+        "THROUGH must re-target from the fresh detection, not freeze on stale pos"
+
+
+def test_should_advance_gate_vision_only_no_false_pass(monkeypatch):
+    """Bug 6: with no course and no detection, no gate pass is declared."""
+    import config.loader as loader
+    monkeypatch.setattr(loader.cfg.sim, "mock_use_course", False)
+    from drone_main import AutonomyLoop
+    loop = AutonomyLoop(mode="mock", run_id="t_adv_vis", show_view=False)
+    loop._course = None
+    state = loop._estimator.get_estimate()
+    assert loop._should_advance_gate(False, None, state, None) is False
+
+
+def test_should_advance_gate_ground_truth_proximity():
+    """Bug 6: ground-truth proximity to the current gate advances."""
+    from drone_main import AutonomyLoop
+    loop = AutonomyLoop(mode="mock", run_id="t_adv_gt", show_view=False)
+    loop._current_gate_idx = 0
+    state = loop._estimator.get_estimate()
+    gate = loop._course[0]
+
+    gt_on = SimpleNamespaceGT(gate.copy())
+    assert loop._should_advance_gate(False, None, state, gt_on) is True
+
+
+class SimpleNamespaceGT:
+    def __init__(self, pos):
+        self.pos = pos
+
+
+def test_detection_history_resets_on_gate_pass():
+    """Bug 5: passing a gate clears the held detection so we don't keep
+    steering toward the gate we just passed."""
+    from drone_main import AutonomyLoop
+    loop = AutonomyLoop(mode="mock", run_id="t_hist", show_view=False)
+    loop._current_gate_idx = 0
+    loop._last_detection = object()
+    loop._detection_age = 3
+    loop._on_gate_passed(0.5)
+    assert loop._last_detection is None
+    assert loop._detection_age == 0
+
+
+def test_detection_history_frames_is_short():
+    """Bug 5: the main-loop stale-hold is short (was 20)."""
+    from config.loader import cfg
+    assert cfg.perception.detection_history_frames <= 5
+
+
+def test_vision_update_projects_gate_to_correct_side():
+    """Bug 4: a gate pixel to the RIGHT of center (heading north, NED) must pull
+    the estimate toward +east, not -east. The old code inverted this."""
+    from state.estimator import DroneStateEstimator
+    est = DroneStateEstimator()
+    est._kf.x[:3, 0] = np.array([0.0, 0.0, 0.0])
+    est._att_deg = np.zeros(3)
+    w, h = 640, 360
+    est.update_from_vision(gate_center_px=(w * 0.75, h / 2.0),
+                           distance_m=4.0, frame_w=w, frame_h=h)
+    pos = est.get_estimate().pos
+    assert pos[0] > 0.0, "forward gate should pull estimate north (+x)"
+    assert pos[1] > 0.0, "right-of-center gate should pull estimate east (+y)"
+
 
 def test_full_control_cycle():
     """Smoke test: run one tick through all modules without crashing."""

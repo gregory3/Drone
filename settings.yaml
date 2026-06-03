@@ -19,7 +19,13 @@ perception:
   gate_min_area_px: 400       # Minimum contour area to count as a gate candidate
   gate_max_area_px: 180000
   gate_confidence_threshold: 0.55
-  detection_history_frames: 20 # Frames to hold a gate prediction when lost (ride through brief dropouts before recovery)
+  detection_history_frames: 5  # Frames the MAIN loop holds a stale detection on a brief dropout.
+                               # Lowered from 20: at 50Hz, 20 frames = 0.4s of flying toward a
+                               # gate that may already be behind us. The temporal smoother
+                               # (temporal_smoothing_miss_tolerance) already rides short dropouts.
+  recovery_trigger_frames: 18  # Missed frames before the RECOVERY behaviour engages. Decoupled
+                               # from detection_history_frames so shrinking the stale-hold above
+                               # doesn't make recovery hair-trigger (was implicitly 20).
   temporal_smoothing_frames: 4 # Smooth gate detections across recent frames
   temporal_smoothing_miss_tolerance: 2 # Keep last smoothed detection for short dropouts
   detection_max_center_jump_px: 120 # Reject inconsistent detections from history
@@ -69,11 +75,14 @@ state_estimation:
 
 planning:
   gate_approach_distance_m: 1.5   # How far in front of gate to start final alignment
-  gate_through_offset_m: 0.8      # How far past the gate center to target for a clean pass
+  gate_through_offset_m: 1.5      # How far past the gate center to target for a clean pass.
+                                  # Raised from 0.8 so the through-target sits clearly
+                                  # past the gate plane -> reliably trips the plane-cross pass check.
   gate_pass_plane_dist_m: 0.2     # Signed distance beyond gate plane to count as passed
   waypoint_tolerance_m: 0.3       # Distance at which a waypoint is considered reached
   lookahead_gates: 2              # How many gates ahead to pre-plan
   recovery_search_yaw_rate: 15.0  # deg/s yaw sweep when gate is lost (gentler so a brief loss doesn't spin away)
+  gate_yaw_kp_dps: 60.0           # Perception-aware yaw: deg/s of yaw per unit of gate horizontal offset (gate at frame edge -> ~60 deg/s turn to recenter). Keeps the gate in FOV through turns (Swift r_perc as a control law).
   recovery_climb_m: 0.3           # Slight altitude gain during recovery
   recovery_resume_confirm_frames: 2  # Frames of stable detection required to exit recovery
   # Vision-only gate-pass detection (used when no global course/map is available,
@@ -110,7 +119,10 @@ control:
   thrust_kp_climb: 0.12        # thrust per (m/s) of desired climb rate (enough to lift off)
   thrust_kd_climb: 0.08        # thrust damping per (m/s) of actual climb rate
   thrust_min: 0.1
-  thrust_max: 0.6             # safety cap during tuning (drone is very powerful)
+  thrust_max: 0.85           # Raised from 0.6: tuning is over. Hard race maneuvers
+                             # need near-full collective authority or the drone sinks
+                             # and clips gates. hover_thrust should be set by
+                             # tools/calibrate_hover.py, not guessed.
 
 telemetry:
   log_dir: "logs"

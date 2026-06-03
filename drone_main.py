@@ -358,38 +358,13 @@ class AutonomyLoop:
         self._sim.send_velocity_command(ctrl.vx, ctrl.vy, ctrl.vz, ctrl.yaw_rate)
         self._estimator.set_command_velocity(np.array([ctrl.vx, ctrl.vy, ctrl.vz]))
 
-        # --- check gate passage ---
-        # Vision-only path (no global course/map — live AI-GP sim). Infer the
-        # pass from appearance: gate grows large + centered, then drops out.
-        if self._course is None:
-            if self._check_vision_gate_pass(gate_detected_actual, best_det):
-                self._on_gate_passed(t_rel)
-                self._gate_passed_this_cycle = True
-
-        if not self._gate_passed_this_cycle and gate_detected \
-                and best_det.distance_est_m is not None:
-            if best_det.distance_est_m < self._gate_passed_threshold_m:
-                self._on_gate_passed(t_rel)
-                self._gate_passed_this_cycle = True
-
-        if not self._gate_passed_this_cycle and self._last_gate_pos is not None \
-                and self._phase in {PHASE_APPROACH, PHASE_THROUGH}:
-            if np.linalg.norm(state.pos - self._last_gate_pos) < self._gate_passed_threshold_m:
-                self._on_gate_passed(t_rel)
-                self._gate_passed_this_cycle = True
-
-        if not self._gate_passed_this_cycle and self._course is not None \
-                and self._current_gate_idx < len(self._course):
-            if self._gate_passed_by_plane(state.pos, self._course[self._current_gate_idx]):
-                self._on_gate_passed(t_rel)
-                self._gate_passed_this_cycle = True
-
-        if not self._gate_passed_this_cycle and self._course is not None \
-                and self._current_gate_idx < len(self._course) and gt is not None:
-            gate_world = self._course[self._current_gate_idx]
-            if np.linalg.norm(gt.pos - gate_world) < self._gate_passed_threshold_m:
-                self._on_gate_passed(t_rel)
-                self._gate_passed_this_cycle = True
+        # --- check gate passage (single prioritized decision) ---
+        # Replaces five overlapping if-blocks whose firing order depended on
+        # which sensors happened to be healthy. _should_advance_gate has one
+        # clear priority chain.
+        if self._should_advance_gate(gate_detected_actual, best_det, state, gt):
+            self._on_gate_passed(t_rel)
+            self._gate_passed_this_cycle = True
 
         # --- log ---
         loop_dt_ms = (time.time() - t0) * 1000
@@ -464,15 +439,24 @@ class AutonomyLoop:
     def _compute_target(self, gate_detected, best_det, state, obs, gt=None):
         """Determine where to fly this cycle. Returns (target_pos, yaw_rate_override)."""
 
-        # --- recovery check ---
-        if self._phase == PHASE_THROUGH and self._last_gate_pos is not None:
-            # If the gate was recently visible, continue to the through target
-            # using the last known gate position rather than switching to recovery.
+        # THROUGH is a *speed mode*, not a blanket targeting override. The old
+        # code early-returned a frozen through-target for EVERY tick in THROUGH,
+        # skipping detection entirely — so a fresh detection of the next gate was
+        # ignored and the pass checks never re-evaluated.
+        #
+        # Corrected: only carry momentum when there is NO fresh detection this
+        # tick (we're flying through the gate and briefly lost sight of it). We
+        # drive to a FIXED point just past the gate plane so we coast across it
+        # instead of stalling in a recovery hold. A fresh/held detection falls
+        # through to full re-targeting below (re-acquiring the next gate). The
+        # target is bounded (gate + offset), so a genuinely lost gate just means
+        # we stop past the plane — no runaway, no out-of-bounds DSQ.
+        if self._phase == PHASE_THROUGH and not gate_detected \
+                and self._last_gate_pos is not None:
             if self._course is not None and self._current_gate_idx < len(self._course):
                 gate_world = self._course[self._current_gate_idx]
                 direction = self._course_direction(state.pos, gate_world)
-                through_target = gate_world + direction * cfg.planning.gate_through_offset_m
-                return through_target, None
+                return gate_world + direction * cfg.planning.gate_through_offset_m, None
             return self._last_gate_pos.copy(), None
 
         confidence = best_det.confidence if best_det is not None else 0.0
@@ -545,7 +529,13 @@ class AutonomyLoop:
                     self._phase = PHASE_THROUGH
 
             if gate_target is not None:
-                return gate_target, None
+                # Perception-aware yaw (Swift's r_perc, as a control law): turn
+                # to keep the detected gate centered in the frame. Without this,
+                # a gate drifting to the frame edge (the hard right turn after
+                # gate 0) slides out of view and is lost. Yaw rate is
+                # proportional to the gate's horizontal pixel offset.
+                yaw_override = self._gate_centering_yaw(best_det)
+                return gate_target, yaw_override
 
         # No gate — search: hold position and yaw slowly.
         # In mock mode, use the next course gate as a fallback target.
@@ -606,6 +596,56 @@ class AutonomyLoop:
             self._detector.reset()
         self._recovery.reset()
         self._controller.reset()
+
+    def _gate_centering_yaw(self, best_det):
+        """Yaw rate (deg/s) that turns the drone to face the detected gate.
+
+        Proportional to the gate's horizontal offset from image centre, so the
+        camera tracks the gate as it drifts toward the frame edge (keeping it in
+        FOV through turns). Returns None if no usable detection.
+        """
+        if best_det is None or best_det.center_px is None:
+            return None
+        u = best_det.center_px[0]
+        offset_frac = (u - self._camera_cx) / self._camera_cx  # -1 (left) .. +1 (right)
+        kp = getattr(cfg.planning, "gate_yaw_kp_dps", 70.0)
+        max_yaw = cfg.control.max_yaw_rate_dps
+        return float(np.clip(offset_frac * kp, -max_yaw, max_yaw))
+
+    def _should_advance_gate(self, gate_detected_actual: bool, best_det,
+                             state, gt) -> bool:
+        """Single, prioritized decision: did we just pass the current gate?
+
+        Priority chain, most reliable source first:
+          - No course/map (live AI-GP sim): vision appearance pass only.
+          - Course available: ground-truth proximity (mock/debug) ->
+            EKF plane crossing (only when the filter is healthy) ->
+            fresh-detection distance fallback.
+        """
+        # Vision-only path (no global course/map — live AI-GP sim). Infer the
+        # pass from appearance: gate grows large + centered, then drops out.
+        if self._course is None:
+            return self._check_vision_gate_pass(gate_detected_actual, best_det)
+
+        if self._current_gate_idx >= len(self._course):
+            return False
+        gate_world = self._course[self._current_gate_idx]
+
+        # 1) Ground-truth proximity — perfect position, mock/debug only.
+        if gt is not None and \
+                np.linalg.norm(gt.pos - gate_world) < self._gate_passed_threshold_m:
+            return True
+
+        # 2) Plane crossing via EKF position — trust only when EKF is healthy.
+        if state.is_healthy and self._gate_passed_by_plane(state.pos, gate_world):
+            return True
+
+        # 3) Distance fallback from a fresh detection.
+        if best_det is not None and best_det.distance_est_m is not None \
+                and best_det.distance_est_m < self._gate_passed_threshold_m:
+            return True
+
+        return False
 
     def _check_vision_gate_pass(self, gate_detected_actual: bool,
                                 best_det) -> bool:
@@ -711,7 +751,26 @@ def main():
                         help="Stream telemetry to Rerun (requires rerun-sdk installed)")
     parser.add_argument("--replay", action="store_true",
                         help="Replay last run instead of flying")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Run hover-thrust calibration against the live sim and exit "
+                             "(writes hover_thrust to settings.yaml)")
+    parser.add_argument("--verify-signs", action="store_true",
+                        help="Verify attitude sign conventions against the live sim and exit "
+                             "(patches control/velocity_to_attitude.py if inverted)")
     args = parser.parse_args()
+
+    if args.calibrate:
+        from tools.calibrate_hover import calibrate, write_back
+        value = calibrate(port=cfg.sim.mavlink_port, timeout=cfg.sim.connect_timeout_s,
+                          lo=0.15, hi=0.55, hold_s=3.0, tol_m=0.1, rate_hz=50.0,
+                          max_iters=10)
+        write_back(value)
+        return
+
+    if args.verify_signs:
+        from tools.verify_attitude_signs import main as verify_main
+        verify_main()
+        return
 
     if args.export is not None:
         out_dir = args.export_out
