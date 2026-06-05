@@ -901,6 +901,107 @@ def test_vision_update_projects_gate_to_correct_side():
     assert pos[1] > 0.0, "right-of-center gate should pull estimate east (+y)"
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 upgrade tests
+# ---------------------------------------------------------------------------
+
+def test_speed_cap_scales_with_confidence():
+    """Upgrade 3: low confidence collapses the cap to recovery speed; high
+    confidence yields the full phase ceiling."""
+    from drone_main import AutonomyLoop, PHASE_APPROACH
+    from config.loader import cfg
+    loop = AutonomyLoop(mode="mock", run_id="t_speedcap", show_view=False)
+    loop._phase = PHASE_APPROACH
+    lo = loop._speed_cap_for_phase(0.0)
+    hi = loop._speed_cap_for_phase(1.0)
+    assert abs(lo - cfg.drone.recovery_speed_mps) < 1e-6
+    assert abs(hi - cfg.drone.approach_speed_mps) < 1e-6
+    assert lo < hi
+
+
+def test_racing_target_bends_toward_next_gate():
+    """Upgrade 2: the through-point curves toward the next gate, not straight."""
+    from drone_main import AutonomyLoop
+    loop = AutonomyLoop(mode="mock", run_id="t_racing", show_view=False)
+    loop._current_gate_idx = 0
+    gate = np.array([5.0, 0.0, 1.5])
+    nxt = np.array([8.0, 4.0, 1.5])      # next gate is off to +y
+    loop._course = [gate, nxt]
+    state_pos = np.array([4.9, 0.0, 1.5])  # close -> high blend toward next
+    target = loop._racing_through_target(state_pos, gate, np.array([1.0, 0.0, 0.0]))
+    assert target[1] > 0.0, "racing line should bend toward the next gate (+y)"
+
+
+def test_racing_target_straight_when_no_next_gate():
+    """Upgrade 2: with no next gate, fall back to a straight through-target."""
+    from drone_main import AutonomyLoop
+    from config.loader import cfg
+    loop = AutonomyLoop(mode="mock", run_id="t_racing_last", show_view=False)
+    loop._current_gate_idx = 0
+    gate = np.array([5.0, 0.0, 1.5])
+    loop._course = [gate]
+    direction = np.array([1.0, 0.0, 0.0])
+    target = loop._racing_through_target(np.array([4.0, 0.0, 1.5]), gate, direction)
+    expected = gate + direction * cfg.planning.gate_through_offset_m
+    assert np.allclose(target, expected)
+
+
+def test_recovery_dead_reckons_along_heading():
+    """Upgrade 8: a blind advance creeps forward along the last-seen heading
+    and holds altitude, rather than chasing a stale absolute position."""
+    from planning.recovery import RecoveryBehavior, RecoveryState
+    rec = RecoveryBehavior()
+    pos = np.array([5.0, 0.0, 1.5])
+    # See the gate once facing +x (heading 0) so the heading is stored.
+    rec.update(gate_detected=True, gate_confidence=0.9, current_pos=pos,
+               last_gate_pos=np.array([10.0, 0.0, 1.5]), heading_rad=0.0)
+    # Force into the blind-advance state with enough missed frames to act.
+    rec._frames_without_gate = rec._trigger_frames
+    rec._state = RecoveryState.ADVANCE_BLIND
+    rec._start_t = time.time()
+
+    phase, target, _ = rec.update(gate_detected=False, gate_confidence=0.0,
+                                  current_pos=pos, last_gate_pos=None)
+    assert phase == "recovery"
+    assert target[0] > pos[0], "should creep forward along heading (+x)"
+    assert abs(target[2] - pos[2]) < 1e-6, "altitude held during dead-reckon"
+
+
+def test_recovery_sweep_duration_reduced():
+    """Upgrade 8: the yaw-sweep hold was halved."""
+    from planning.recovery import RecoveryBehavior
+    assert RecoveryBehavior.SWEEP_DURATION_S <= 3.0
+
+
+def test_vision_only_recovery_holds_position(monkeypatch):
+    """Live fix: in vision-only (no course) mode, recovery must hover in place,
+    not feed a garbage-EKF position target through the PID (which drifted the
+    real drone backward+up out of bounds). Translation must be zeroed."""
+    import config.loader as loader
+    from planning.recovery import RecoveryState
+    monkeypatch.setattr(loader.cfg.sim, "mock_use_course", False)
+    monkeypatch.setattr(loader.cfg.sim, "mock_use_ground_truth", False)
+    from drone_main import AutonomyLoop
+
+    loop = AutonomyLoop(mode="mock", run_id="t_rec_hold", show_view=False)
+    loop._course = None
+    monkeypatch.setattr(loop._detector, "detect", lambda img: [])
+    # Force the recovery behaviour into an active sweep.
+    loop._recovery._frames_without_gate = loop._recovery._trigger_frames + 5
+    loop._recovery._state = RecoveryState.YAW_SWEEP
+    loop._recovery._start_t = time.time()
+
+    sent = {}
+    def cap(vx, vy, vz, yaw_rate=0.0):
+        sent.update(vx=vx, vy=vy, vz=vz, yaw=yaw_rate)
+    monkeypatch.setattr(loop._sim, "send_velocity_command", cap)
+    loop._start_t = time.time() - 10.0   # past the takeoff window
+
+    loop._tick()
+    assert loop._phase == "recovery"
+    assert sent["vx"] == 0.0 and sent["vy"] == 0.0 and sent["vz"] == 0.0
+
+
 def test_full_control_cycle():
     """Smoke test: run one tick through all modules without crashing."""
     from drone_sim.interface import MockSimInterface

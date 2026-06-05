@@ -33,7 +33,9 @@ class RecoveryState(Enum):
 
 class RecoveryBehavior:
 
-    SWEEP_DURATION_S = 6.0       # How long to hold + yaw-sweep before advancing
+    SWEEP_DURATION_S = 3.0       # How long to hold + yaw-sweep before advancing.
+                                 # Halved from 6.0: at 50Hz, 6s of holding = 300
+                                 # frozen loops. 3s is enough to re-acquire or move on.
     BLIND_ADVANCE_DURATION_S = 1.5
     ALTITUDE_GAIN_M = 0.2
 
@@ -41,6 +43,7 @@ class RecoveryBehavior:
         self._state = RecoveryState.IDLE
         self._start_t: Optional[float] = None
         self._last_known_gate_pos: Optional[np.ndarray] = None
+        self._last_heading_rad: Optional[float] = None
         self._sweep_dir = 1.0   # +1 or -1 yaw direction
         self._frames_without_gate = 0
         # Recovery engages after this many consecutive missed frames. Decoupled
@@ -56,7 +59,8 @@ class RecoveryBehavior:
     def update(self, gate_detected: bool,
                gate_confidence: float,
                current_pos: np.ndarray,
-               last_gate_pos: Optional[np.ndarray]) -> Tuple[str, np.ndarray, float]:
+               last_gate_pos: Optional[np.ndarray],
+               heading_rad: Optional[float] = None) -> Tuple[str, np.ndarray, float]:
         """
         Returns: (phase_name, target_pos_cmd, yaw_rate_cmd)
 
@@ -64,8 +68,13 @@ class RecoveryBehavior:
         phase_name: 'recovery' | 'resume'
         target_pos_cmd: where to fly
         yaw_rate_cmd: yaw rate in deg/s
+        heading_rad: current heading; stored while the gate is visible so a
+            blind advance can dead-reckon forward instead of chasing a stale
+            absolute position.
         """
         if gate_detected:
+            if heading_rad is not None:
+                self._last_heading_rad = heading_rad
             self._frames_without_gate = 0
             self._resume_confirm_frames += 1
             if self._state == RecoveryState.IDLE:
@@ -120,17 +129,21 @@ class RecoveryBehavior:
             return ("recovery", hover_target, yaw_rate)
 
         if self._state == RecoveryState.ADVANCE_BLIND:
-            # Slowly advance toward last known gate position
-            if self._last_known_gate_pos is not None:
-                direction = self._last_known_gate_pos - current_pos
-                norm = np.linalg.norm(direction)
-                if norm > 0.1:
-                    step = direction / norm * cfg.drone.recovery_speed_mps * 0.5
-                    target = current_pos + step
-                else:
-                    target = self._last_known_gate_pos
+            # Dead-reckoning (MonoRace principle): the absolute position estimate
+            # has drifted by the time we get here, so DON'T chase a stale
+            # last_known_gate_pos. Instead hold altitude and creep forward along
+            # the heading the gate was last seen on — gentle (0.3x recovery
+            # speed) and time-bounded, so a genuinely lost gate can't fly us out
+            # of bounds. Falls back to a small climb if we never had a heading.
+            if self._last_heading_rad is not None:
+                step_fwd = cfg.drone.recovery_speed_mps * 0.3
+                step = np.array([
+                    np.cos(self._last_heading_rad) * step_fwd,
+                    np.sin(self._last_heading_rad) * step_fwd,
+                    0.0,                       # hold altitude
+                ])
+                target = current_pos + step
             else:
-                # No last known position — hold and yaw
                 target = current_pos.copy()
                 target[2] += self.ALTITUDE_GAIN_M
 
@@ -154,4 +167,5 @@ class RecoveryBehavior:
         self._start_t = None
         self._frames_without_gate = 0
         self._last_known_gate_pos = None
+        self._last_heading_rad = None
         self._resume_confirm_frames = 0

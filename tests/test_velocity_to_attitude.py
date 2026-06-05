@@ -24,11 +24,19 @@ def test_forward_velocity_pitches_nose_down():
     assert abs(cmd.roll_rate) < 1e-6
 
 
-def test_right_velocity_rolls_right():
+def test_right_velocity_maps_to_configured_roll_sign():
+    # Rightward (east) velocity must roll in the direction the LIVE sim needs.
+    # SIGN_ROLL_RIGHT was verified against the real FlightSim build on
+    # 2026-06-03 (a "fly right" command moved the drone -21m east with the old
+    # +1.0 sign, i.e. inverted) and corrected to -1.0. The test checks the
+    # translator applies that verified sign rather than a hardcoded assumption.
+    from control.velocity_to_attitude import SIGN_ROLL_RIGHT
     v = VelocityToAttitude()
     cmd = v.convert(vx=0.0, vy=2.0, vz=0.0, yaw_rad=0.0,
                     roll_rad=0.0, pitch_rad=0.0)
-    assert cmd.roll_rate > 0, "rightward (east) -> positive roll rate"
+    assert cmd.roll_rate != 0.0
+    assert (cmd.roll_rate > 0) == (SIGN_ROLL_RIGHT > 0), \
+        "roll command must follow the verified SIGN_ROLL_RIGHT convention"
     assert abs(cmd.pitch_rate) < 1e-6
 
 

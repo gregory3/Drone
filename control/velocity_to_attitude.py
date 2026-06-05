@@ -39,7 +39,12 @@ from config.loader import cfg
 
 # Sign conventions — see module docstring. Flip these if the sim tune differs.
 SIGN_PITCH_FORWARD = -1.0   # forward velocity -> negative pitch (nose down)
-SIGN_ROLL_RIGHT = +1.0      # rightward velocity -> positive roll
+                            # VERIFIED live 2026-06-03: forward cmd -> dN=+0.84m (correct).
+SIGN_ROLL_RIGHT = -1.0      # rightward velocity -> negative roll on THIS sim build.
+                            # VERIFIED live 2026-06-03 via tools/verify_attitude_signs:
+                            # the old +1.0 sent a "fly right" command 21m to the LEFT
+                            # (dE=-21.2m) — an inverted-roll runaway that threw the drone
+                            # off course on the first right-hand turn. Flipped to -1.0.
 SIGN_YAW = +1.0             # positive yaw_rate request -> positive body yaw rate
 
 

@@ -337,22 +337,31 @@ class AutonomyLoop:
 
         # --- control ---
         confidence = best_det.confidence if gate_detected else 0.3
-        max_speed = cfg.drone.max_speed_mps
-        if self._phase == PHASE_APPROACH:
-            max_speed = cfg.drone.approach_speed_mps
-        elif self._phase == PHASE_THROUGH:
-            max_speed = cfg.drone.through_speed_mps
-        elif self._phase == PHASE_RECOVERY:
-            max_speed = cfg.drone.recovery_speed_mps
+        max_speed = self._speed_cap_for_phase(confidence)
 
+        # _speed_cap_for_phase already folds detection confidence into max_speed,
+        # so pass confidence=1.0 here to avoid throttling by confidence twice
+        # (the double penalty made moderate-confidence flight slower than the old
+        # flat caps). The cap is the single confidence authority now.
         ctrl = self._controller.compute(
             current_pos=state.pos,
             target_pos=target_pos,
-            confidence=confidence,
+            confidence=1.0,
             max_speed=max_speed,
         )
         if yaw_rate_override is not None:
             ctrl.yaw_rate = yaw_rate_override
+
+        # Vision-only recovery hold: with no course/map the EKF has no absolute
+        # reference, so feeding a position target through the PID just chases a
+        # drifting garbage estimate. Live runs showed this as a constant
+        # backward+climb drift out of bounds into the black void (never
+        # re-acquiring). Instead, hover in place (zero translation, hold
+        # altitude) and let the yaw-search sweep bring a gate back into frame.
+        if self._phase == PHASE_RECOVERY and self._course is None:
+            ctrl.vx = 0.0
+            ctrl.vy = 0.0
+            ctrl.vz = 0.0
 
         # --- command drone ---
         self._sim.send_velocity_command(ctrl.vx, ctrl.vy, ctrl.vz, ctrl.yaw_rate)
@@ -456,7 +465,7 @@ class AutonomyLoop:
             if self._course is not None and self._current_gate_idx < len(self._course):
                 gate_world = self._course[self._current_gate_idx]
                 direction = self._course_direction(state.pos, gate_world)
-                return gate_world + direction * cfg.planning.gate_through_offset_m, None
+                return self._racing_through_target(state.pos, gate_world, direction), None
             return self._last_gate_pos.copy(), None
 
         confidence = best_det.confidence if best_det is not None else 0.0
@@ -465,6 +474,7 @@ class AutonomyLoop:
             gate_confidence=confidence,
             current_pos=state.pos,
             last_gate_pos=self._last_gate_pos,
+            heading_rad=float(np.radians(state.att_deg[2])),
         )
         if phase_out == "recovery":
             self._phase = PHASE_RECOVERY
@@ -478,7 +488,7 @@ class AutonomyLoop:
                 self._last_gate_pos = gate_world.copy()
                 direction = self._course_direction(state.pos, gate_world)
                 approach_target = gate_world - direction * cfg.planning.gate_approach_distance_m
-                through_target = gate_world + direction * cfg.planning.gate_through_offset_m
+                through_target = self._racing_through_target(state.pos, gate_world, direction)
                 distance_to_gate = np.linalg.norm(gate_world - state.pos)
 
                 if distance_to_gate > cfg.planning.gate_approach_distance_m + 0.1:
@@ -612,6 +622,34 @@ class AutonomyLoop:
         max_yaw = cfg.control.max_yaw_rate_dps
         return float(np.clip(offset_frac * kp, -max_yaw, max_yaw))
 
+    def _speed_cap_for_phase(self, confidence: float) -> float:
+        """Confidence-scaled speed ceiling for the current phase.
+
+        The phase sets the *ceiling* (approach/through/recovery); detection
+        confidence sets how much of it we're allowed to use. Below
+        speed_confidence_floor the cap collapses to recovery_speed (creep when
+        blind); at/above speed_confidence_ceil we get the full phase ceiling.
+        This is "confidence is speed authority" — fast when locked on, cautious
+        when the gate is uncertain.
+        """
+        d = cfg.drone
+        if self._phase == PHASE_APPROACH:
+            phase_max = d.approach_speed_mps
+        elif self._phase == PHASE_THROUGH:
+            phase_max = d.through_speed_mps
+        elif self._phase == PHASE_RECOVERY:
+            phase_max = d.recovery_speed_mps
+        else:
+            phase_max = d.max_speed_mps
+
+        floor = getattr(d, "speed_confidence_floor", 0.4)
+        ceil = getattr(d, "speed_confidence_ceil", 0.85)
+        recovery = d.recovery_speed_mps
+        if ceil <= floor:
+            return phase_max
+        conf_scale = float(np.clip((confidence - floor) / (ceil - floor), 0.0, 1.0))
+        return recovery + conf_scale * (phase_max - recovery)
+
     def _should_advance_gate(self, gate_detected_actual: bool, best_det,
                              state, gt) -> bool:
         """Single, prioritized decision: did we just pass the current gate?
@@ -673,6 +711,34 @@ class AutonomyLoop:
             self._gate_was_close = False
             return True
         return False
+
+    def _racing_through_target(self, state_pos: np.ndarray,
+                               gate_world: np.ndarray,
+                               direction_in: np.ndarray) -> np.ndarray:
+        """Through-target that bends toward the NEXT gate to carry momentum.
+
+        Reactive flight aims straight through the gate then hard-turns for the
+        next one, bleeding speed. World-class lines (Swift/MonoRace) curve the
+        exit toward the next gate. As we close on the current gate we blend the
+        entry direction toward the exit (next-gate) direction, so the through
+        point sits on the racing line. Falls back to a straight through-target
+        when there is no next gate.
+        """
+        offset = cfg.planning.gate_through_offset_m
+        next_idx = self._current_gate_idx + 1
+        if self._course is not None and next_idx < len(self._course):
+            out = self._course[next_idx] - gate_world
+            n = float(np.linalg.norm(out))
+            if n > 1e-3:
+                direction_out = out / n
+                dist = float(np.linalg.norm(gate_world - state_pos))
+                blend = float(np.clip(
+                    1.0 - dist / cfg.planning.gate_approach_distance_m, 0.0, 1.0))
+                racing_dir = (1.0 - blend) * direction_in + blend * direction_out
+                rn = float(np.linalg.norm(racing_dir))
+                if rn > 1e-3:
+                    return gate_world + (racing_dir / rn) * offset
+        return gate_world + direction_in * offset
 
     def _course_direction(self, state_pos: np.ndarray, gate_world: np.ndarray) -> np.ndarray:
         if self._course is None or len(self._course) == 0:

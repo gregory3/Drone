@@ -2,11 +2,22 @@
 # All tuneable parameters live here. Never hardcode values in source files.
 
 drone:
-  max_speed_mps: 2.0          # Lowered from 3.0: in fly16 the drone darted + banked 30deg+, whipping gates out of frame. Calmer = gate stays in FOV (Swift's perception-awareness, done mechanically). Raise once tracking is solid.
+  # Speed caps are now a confidence-scaled curve (see speed_confidence_*). These
+  # are the CEILINGS hit only at high detection confidence; low confidence slides
+  # the cap down toward recovery_speed_mps. Raised modestly from the fly16-era
+  # values now that perception-aware yaw keeps the gate in frame — push higher on
+  # the rig once the real ACRO tune is confirmed (mock integrates velocity
+  # directly, so mock lap time over-rewards raw speed).
+  max_speed_mps: 2.8          # Absolute ceiling
   max_accel_mps2: 4.0
-  approach_speed_mps: 1.5     # Speed used when flying toward a detected gate
-  through_speed_mps: 2.0      # Speed maintained passing through gate center (was 2.5)
+  approach_speed_mps: 2.0     # Ceiling while flying toward a detected gate (was 1.5)
+  through_speed_mps: 2.5      # Ceiling passing through the gate (was 2.0)
   recovery_speed_mps: 1.0     # Speed during lost-gate recovery maneuver
+  # Confidence -> speed authority (Swift principle: fast when certain, cautious
+  # when not). Below the floor, cap = recovery_speed; at/above the ceil, cap =
+  # full phase speed; linear in between.
+  speed_confidence_floor: 0.4
+  speed_confidence_ceil: 0.85
 
 perception:
   # Camera spec matches the Elodin AI Grand Prix practice rig and the
