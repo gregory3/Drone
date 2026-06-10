@@ -281,6 +281,37 @@ def test_ground_truth_none_before_any_telemetry():
     assert a.get_ground_truth() is None
 
 
+def test_attitude_and_velocity_flow_to_observation():
+    """Spec-legal telemetry (VADR-TS-002 §4.5) must reach the autonomy loop.
+
+    fly14 root cause: the loop reprojected gates with pitch=0 / EKF yaw while
+    the real ATTITUDE sat unused in the adapter snapshot -> phantom +20°
+    target above every gate -> runaway climb off the course."""
+    a = _connected_adapter()
+    a._apply_message(FakeMsg("ATTITUDE",
+                             roll=0.0, pitch=math.radians(10.0),
+                             yaw=math.radians(45.0),
+                             rollspeed=0, pitchspeed=0, yawspeed=0,
+                             time_boot_ms=0))
+    a._apply_message(FakeMsg("ODOMETRY",
+                             x=1.0, y=2.0, z=-3.0,
+                             vx=0.5, vy=-0.25, vz=0.1,
+                             q=[1.0, 0.0, 0.0, 0.0]))
+    obs = a.get_observation()
+    assert obs.att_deg is not None, "ATTITUDE must flow into Observation"
+    assert obs.att_deg[1] == pytest.approx(10.0, abs=1e-4)
+    assert obs.att_deg[2] == pytest.approx(45.0, abs=1e-4)
+    assert obs.vel_ned is not None, "NED velocity must flow into Observation"
+    np.testing.assert_allclose(obs.vel_ned, [0.5, -0.25, 0.1])
+
+
+def test_observation_telemetry_none_before_messages():
+    a = _connected_adapter()
+    obs = a.get_observation()
+    assert obs.att_deg is None
+    assert obs.vel_ned is None
+
+
 def test_actuator_output_status_sets_rpm():
     a = _connected_adapter()
     a._apply_message(FakeMsg("ACTUATOR_OUTPUT_STATUS",

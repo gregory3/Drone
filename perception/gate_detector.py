@@ -118,7 +118,11 @@ class ClassicalGateDetector(GateDetector):
                                      dtype=np.uint8)
         self._green_upper = np.array(getattr(p, "green_hsv_upper", [90, 255, 255]),
                                      dtype=np.uint8)
-        self._gate_real_size_m = 1.2   # assume 1.2m gate for distance est.
+        # Real gate size for monocular distance: the red contour's bounding box
+        # spans the OUTER gate frame, which VADR-TS-002 §3.7 fixes at 2.7 m
+        # (inner flyable opening is 1.5 m). The old 1.2 m guess made every
+        # distance estimate ~2.25x too short.
+        self._gate_real_size_m = float(getattr(p, "gate_real_size_m", 2.7))
         self._fx = (p.image_width / 2) / np.tan(np.radians(p.camera_fov_deg / 2))
 
     def _has_green_twin(self, green_mask, x: int, y: int,

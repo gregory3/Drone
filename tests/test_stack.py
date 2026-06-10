@@ -839,6 +839,61 @@ def test_through_phase_uses_fresh_detection_vision_only(monkeypatch):
         "THROUGH must re-target from the fresh detection, not freeze on stale pos"
 
 
+def test_classical_detector_distance_uses_spec_gate_size():
+    """VADR-TS-002 §3.7: the outer gate frame is 2.7 m and the red contour's
+    bbox spans it. dist = gate_real_size_m * fx / w_px. The old hard-coded
+    1.2 m guess read every distance ~2.25x too short, corrupting phase
+    transitions and EKF vision updates."""
+    import cv2
+    from perception.gate_detector import ClassicalGateDetector
+    from config.loader import cfg
+
+    assert cfg.perception.gate_real_size_m == pytest.approx(2.7)
+
+    det = ClassicalGateDetector()
+    frame = np.zeros((360, 640, 3), dtype=np.uint8)
+    cv2.rectangle(frame, (280, 140), (359, 219), (0, 0, 255), thickness=-1)
+    dets = det.detect(frame)
+    assert dets, "a solid red square must be detected"
+    w_px = dets[0].bbox_px[2]
+    expected = cfg.perception.gate_real_size_m * 320.0 / w_px  # fx=320 @90° HFOV
+    assert dets[0].distance_est_m == pytest.approx(expected, rel=0.05)
+    assert dets[0].distance_est_m == pytest.approx(10.8, rel=0.15)
+
+
+def test_vision_reprojection_uses_real_pitch(monkeypatch):
+    """fly14 regression: with the 20° up-tilt camera, a centred gate is level
+    with the drone only when the nose is pitched DOWN 20°. The loop must take
+    pitch from state.att_deg (sim ATTITUDE telemetry), never assume 0 — the
+    old pitch=0 fallback placed a phantom target d*sin(20°) above every gate
+    and the drone climbed off the course chasing it."""
+    import config.loader as loader
+    monkeypatch.setattr(loader.cfg.sim, "mock_use_course", False)
+    from drone_main import AutonomyLoop
+    from perception.gate_detector import GateDetection
+
+    loop = AutonomyLoop(mode="mock", run_id="t_reproj_pitch", show_view=False)
+    loop._course = None
+    d = 10.0
+    det = GateDetection(center_px=(loop._camera_cx, loop._camera_cy),
+                        bbox_px=(0, 0, 100, 100), area_px=10000.0,
+                        confidence=0.9, distance_est_m=d)
+
+    state = loop._estimator.get_estimate()
+    state.pos = np.array([0.0, 0.0, 0.0])
+    state.att_deg = np.array([0.0, -20.0, 0.0])  # nose-down cancels camera tilt
+    t_level, _ = loop._compute_target(gate_detected=True, best_det=det,
+                                      state=state, obs=None, gt=None)
+    assert abs(t_level[2]) < 0.2, \
+        "tilt-compensated pitch must yield a level target"
+
+    state.att_deg = np.array([0.0, 0.0, 0.0])
+    t_zero, _ = loop._compute_target(gate_detected=True, best_det=det,
+                                     state=state, obs=None, gt=None)
+    assert abs(t_zero[2]) > 2.0, \
+        "pitch=0 must show the 20° camera-tilt bias (sanity check)"
+
+
 def test_should_advance_gate_vision_only_no_false_pass(monkeypatch):
     """Bug 6: with no course and no detection, no gate pass is declared."""
     import config.loader as loader

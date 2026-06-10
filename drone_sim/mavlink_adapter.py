@@ -500,6 +500,8 @@ class MavlinkSimInterface(SimInterface):
             rpm = list(snap.rpm)
             image_t = snap.image_t
             last_env_t = snap.last_env_collision_t
+            att_deg = None if snap.att_deg is None else snap.att_deg.copy()
+            vel_ned = None if snap.vel_ned is None else snap.vel_ned.copy()
 
         if image is None:
             # No camera frame yet — synthesize a black BGR frame so the
@@ -514,7 +516,8 @@ class MavlinkSimInterface(SimInterface):
                       (time.time() - last_env_t) < self._env_collision_crash_window_s)
 
         return Observation(image=image, imu=imu, rpm=rpm, timestamp=timestamp,
-                           is_crashed=is_crashed)
+                           is_crashed=is_crashed,
+                           att_deg=att_deg, vel_ned=vel_ned)
 
     def send_velocity_command(self, vx: float, vy: float, vz: float,
                               yaw_rate: float = 0.0) -> None:

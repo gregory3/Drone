@@ -55,6 +55,11 @@ class Observation:
     # Optional extras the real module might provide
     battery_pct: float = 100.0
     is_crashed: bool = False
+    # Spec-legal telemetry (VADR-TS-002 §4.5: "vehicle attitude, orientation,
+    # linear velocities"). Filled by backends that receive it (MAVLink adapter:
+    # ATTITUDE + ODOMETRY/LOCAL_POSITION_NED); None on backends that don't.
+    att_deg: Optional[np.ndarray] = None    # roll, pitch, yaw (deg), pitch>0 = nose up
+    vel_ned: Optional[np.ndarray] = None    # m/s, NED
 
 
 @dataclass

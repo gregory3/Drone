@@ -27,6 +27,9 @@ perception:
   camera_tilt_deg: 20.0
   image_width: 640
   image_height: 360
+  gate_real_size_m: 2.7        # OUTER gate frame width (VADR-TS-002 §3.7); the red
+                               # contour bbox spans the outer frame. Inner flyable
+                               # opening is 1.5m. Drives monocular distance estimates.
   gate_min_area_px: 400       # Minimum contour area to count as a gate candidate
   gate_max_area_px: 180000
   gate_confidence_threshold: 0.55

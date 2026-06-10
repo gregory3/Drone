@@ -249,6 +249,17 @@ class AutonomyLoop:
             state.pos = gt.pos.copy()
             state.vel = gt.vel.copy()
             state.att_deg = gt.att_deg.copy()
+        else:
+            # Spec-legal telemetry override (VADR-TS-002 §4.5: attitude +
+            # linear velocities are provided). The IMU-only EKF attitude/vel
+            # diverge within seconds on the real sim (fly14: 28 m position
+            # drift at t=1.2s), and a wrong yaw here rotates every velocity
+            # command. Position stays EKF: targets are built as pos+relative,
+            # so the absolute term cancels in the controller error.
+            if getattr(obs, "att_deg", None) is not None:
+                state.att_deg = obs.att_deg.copy()
+            if getattr(obs, "vel_ned", None) is not None:
+                state.vel = obs.vel_ned.copy()
 
         # --- perceive ---
         det_t0 = time.time()
@@ -508,14 +519,13 @@ class AutonomyLoop:
                 alpha = np.arctan2(v - self._camera_cy, self._camera_fy)  # down +
                 beta = np.arctan2(u - self._camera_cx, self._camera_fx)   # right +
 
-                # Use the drone's measured attitude (legal sensor data) when
-                # available; pitch>0 = nose up in our convention.
-                if gt is not None:
-                    pitch_rad = np.radians(gt.att_deg[1])
-                    yaw_rad = np.radians(gt.att_deg[2])
-                else:
-                    pitch_rad = 0.0
-                    yaw_rad = np.radians(state.att_deg[2])
+                # state.att_deg is ground truth in mock mode and the sim's
+                # ATTITUDE telemetry in mavlink mode (set in _tick), so pitch
+                # and yaw are always real here; pitch>0 = nose up. pitch=0 with
+                # the 20° up-tilt camera put every centred gate ~20° above the
+                # drone — the fly14 runaway-climb root cause.
+                pitch_rad = np.radians(state.att_deg[1])
+                yaw_rad = np.radians(state.att_deg[2])
 
                 # Ray elevation above horizontal = camera tilt + body pitch - pixel offset.
                 elevation = self._camera_tilt_rad + pitch_rad - alpha
