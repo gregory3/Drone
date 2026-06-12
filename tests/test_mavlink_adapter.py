@@ -513,6 +513,43 @@ def test_auto_arm_throttle_down_then_arms_once():
     assert a._race_armed is True and a._arm_state == "armed"
 
 
+def test_auto_arm_waits_for_race_status_not_imu():
+    """fly15-fly18 + sysid-probe regression: newer sim builds stream
+    HIGHRES_IMU at the PRE-FLIGHT screen, so IMU presence must NOT trigger
+    arming once an authoritative race-status message has been seen. The pilot
+    armed at the menu on every one of those flights and started each race
+    mid-sequence / into stale state."""
+    a = _connected_adapter()
+    a._arm_state = "idle"; a._race_armed = False
+
+    # IMU streams (pre-flight screen) but race-status says NOT started (-1).
+    a._apply_message(FakeMsg("HIGHRES_IMU", xacc=0, yacc=0, zacc=-9.8,
+                             xgyro=0, ygyro=0, zgyro=0, time_usec=1_000))
+    payload = struct.pack(RACE_STATUS_FMT,
+                          ENCAPSULATED_RACE_STATUS_MSG_ID, 50, -1, -1, 0, 0)
+    a._apply_message(FakeMsg("ENCAPSULATED_DATA", data=payload))
+    a._maybe_auto_arm()
+    assert a._arm_state == "idle", \
+        "IMU at the pre-flight screen must not start the arming sequence"
+
+    # Race actually starts (race_start_boot_time_ms >= 0) -> arming proceeds.
+    payload = struct.pack(RACE_STATUS_FMT,
+                          ENCAPSULATED_RACE_STATUS_MSG_ID, 50, 10, -1, 0, 0)
+    a._apply_message(FakeMsg("ENCAPSULATED_DATA", data=payload))
+    a._maybe_auto_arm()
+    assert a._arm_state == "throttle_down"
+    a._throttle_down_start -= 1.0
+    a._maybe_auto_arm()
+    assert a._race_armed is True
+
+    # Race ends (back to -1) -> state machine resets for the next race.
+    payload = struct.pack(RACE_STATUS_FMT,
+                          ENCAPSULATED_RACE_STATUS_MSG_ID, 99, -1, -1, 0, 0)
+    a._apply_message(FakeMsg("ENCAPSULATED_DATA", data=payload))
+    a._maybe_auto_arm()
+    assert a._arm_state == "idle" and a._race_armed is False
+
+
 def test_send_forces_throttle_down_until_armed():
     a = _connected_adapter(control_mode="attitude")
     a._arm_state = "idle"; a._race_armed = False   # not armed yet

@@ -725,7 +725,18 @@ class MavlinkSimInterface(SimInterface):
         if not self._auto_arm or self._conn is None:
             return
         now = time.time()
-        active = self._last_imu_wall > 0 and (now - self._last_imu_wall) < 0.5
+        with self._lock:
+            race_status = self._snap.race_status
+        if race_status is not None:
+            # Authoritative: the sim's own ENCAPSULATED race-status. Newer
+            # builds stream HIGHRES_IMU at the PRE-FLIGHT screen too, so IMU
+            # presence is NOT a race signal — the attitude_sysid probe armed
+            # at the menu and commanded a parked drone for 8s of frozen
+            # telemetry. Every fly15-fly18 pilot armed pre-race this way.
+            active = race_status.race_started
+        else:
+            # Fallback for builds that never send race-status.
+            active = self._last_imu_wall > 0 and (now - self._last_imu_wall) < 0.5
 
         if not active:
             # Race ended / not started → reset so the next race re-arms.
