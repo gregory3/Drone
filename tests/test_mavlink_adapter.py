@@ -454,22 +454,44 @@ def test_attitude_mode_sends_attitude_target_not_setpoint():
 
 
 def test_attitude_mode_uses_live_attitude_for_angle_loop():
-    # Feed an ODOMETRY attitude already tilted to the target; the angle loop
-    # should then command ~0 pitch rate.
+    # Feed an ATTITUDE message already tilted to the target; the angle loop
+    # should then command ~0 pitch rate. ATTITUDE is the authoritative euler
+    # source (tools/attitude_sysid 2026-06-12: the ODOMETRY quat decodes to
+    # (-roll,-pitch,+yaw) vs ATTITUDE on this build and previously fed the
+    # loop inverted feedback -> tumble).
     import math
-    from control.velocity_to_attitude import VelocityToAttitude
     from config.loader import cfg
     a = _connected_adapter(control_mode="attitude")
 
     tilt_per_mps = math.radians(cfg.control.att_tilt_per_mps_deg)
     desired_pitch = -1.0 * 2.0 * tilt_per_mps
-    # Build a quaternion for pitch = desired_pitch (roll=yaw=0): q=(cos(p/2), 0, sin(p/2), 0)
-    half = desired_pitch / 2.0
+    a._apply_message(FakeMsg("ATTITUDE",
+                             roll=0.0, pitch=desired_pitch, yaw=0.0,
+                             rollspeed=0, pitchspeed=0, yawspeed=0,
+                             time_boot_ms=0))
+    a.send_velocity_command(vx=2.0, vy=0.0, vz=0.0)
+    args = a._conn.mav.attitude_targets[0]
+    assert abs(args[6]) < 1e-3, "already at target pitch -> ~0 pitch rate"
+
+
+def test_attitude_mode_quat_fallback_uses_sim_convention():
+    # No ATTITUDE message yet -> the loop falls back to the ODOMETRY quat,
+    # which on this build encodes the NEGATED pitch (sysid-measured). Build
+    # the quat THIS sim would emit for a drone at desired_pitch: standard
+    # decode gives -desired_pitch, adapter must flip it back.
+    import math
+    from config.loader import cfg
+    a = _connected_adapter(control_mode="attitude")
+
+    tilt_per_mps = math.radians(cfg.control.att_tilt_per_mps_deg)
+    desired_pitch = -1.0 * 2.0 * tilt_per_mps
+    half = -desired_pitch / 2.0   # sim quat: standard-decodes to -pitch
     a._apply_message(FakeMsg("ODOMETRY", x=0, y=0, z=0, vx=0, vy=0, vz=0,
                              q=[math.cos(half), 0.0, math.sin(half), 0.0]))
     a.send_velocity_command(vx=2.0, vy=0.0, vz=0.0)
     args = a._conn.mav.attitude_targets[0]
-    assert abs(args[6]) < 1e-3, "already at target pitch -> ~0 pitch rate"
+    assert abs(args[6]) < 1e-3, \
+        "corrected quat fallback at target pitch -> ~0 pitch rate"
 
 
 def test_velocity_mode_still_uses_setpoint():

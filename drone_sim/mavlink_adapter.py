@@ -611,10 +611,20 @@ class MavlinkSimInterface(SimInterface):
             quat = None if self._snap.quat_wxyz is None else self._snap.quat_wxyz.copy()
             vel = None if self._snap.vel_ned is None else self._snap.vel_ned.copy()
 
-        if quat is not None:
-            r, p, y = quaternion_to_euler_deg(quat[0], quat[1], quat[2], quat[3])
-        elif att is not None:
+        # ATTITUDE is the authoritative euler source. The ODOMETRY quaternion
+        # on this build decodes (wxyz) to (-roll, -pitch, +yaw) relative to
+        # ATTITUDE (measured open-loop by tools/attitude_sysid on the tilted
+        # launch stand and through a roll pulse). Preferring the quaternion
+        # fed SIGN-INVERTED roll/pitch into the inner angle loop -> positive
+        # feedback -> the exponential tumble that killed every flight through
+        # fly18. Fall back to the corrected quaternion only if ATTITUDE has
+        # never arrived.
+        if att is not None:
             r, p, y = att[0], att[1], att[2]
+        elif quat is not None:
+            qr, qp, qy = quaternion_to_euler_deg(quat[0], quat[1],
+                                                 quat[2], quat[3])
+            r, p, y = -qr, -qp, qy
         else:
             r = p = y = 0.0
         vz = float(vel[2]) if vel is not None else None
@@ -637,9 +647,12 @@ class MavlinkSimInterface(SimInterface):
             return None
 
         if att is None and quat is not None:
+            # Same convention correction as _current_attitude_and_vz: this
+            # build's ODOMETRY quat decodes to (-roll, -pitch, +yaw) vs
+            # ATTITUDE (tools/attitude_sysid, 2026-06-12).
             roll, pitch, yaw = quaternion_to_euler_deg(
                 quat[0], quat[1], quat[2], quat[3])
-            att = np.array([roll, pitch, yaw], dtype=float)
+            att = np.array([-roll, -pitch, yaw], dtype=float)
 
         return DroneState(
             pos=pos if pos is not None else np.zeros(3),

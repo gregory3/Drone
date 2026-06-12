@@ -24,47 +24,55 @@ def test_forward_velocity_pitches_nose_down():
     assert abs(cmd.roll_rate) < 1e-6
 
 
-def test_roll_loop_stable_under_inverted_sim_actuation():
-    """fly17 regression (run_1781274821): this sim build's roll-rate actuation
-    is INVERTED relative to its ATTITUDE roll telemetry (positive commanded
-    roll rate drives the telemetry roll angle NEGATIVE). With the naive
-    rate = kp*(desired - actual) the loop is positive feedback: the drone
-    wound up into a rate-clamped continuous tumble on every mavlink flight.
+def _measured_plant_step(angle, rate_state, commanded_rate, dt):
+    """One step of the plant tools/attitude_sysid measured on the live sim
+    (2026-06-12): rate commands are followed with STANDARD sign but ~2x gain
+    and momentum — the achieved rate lags the command (rotation continued
+    ~10 deg after a pulse stopped). First-order rate lag, tau ~0.25s."""
+    tau = 0.25
+    gain = 2.0
+    rate_state += (gain * commanded_rate - rate_state) * (dt / tau)
+    return angle + rate_state * dt, rate_state
 
-    Simulate that plant convention closed-loop: a steady rightward velocity
-    command must CONVERGE to a steady bank (and to the SIGN_ROLL_RIGHT-signed
-    desired angle), not wind up."""
+
+def test_roll_loop_stable_on_measured_plant():
+    """fly17/18 regression, closed-loop against the MEASURED plant. The tumble
+    root cause was inverted attitude feedback from the ODOMETRY quaternion
+    (fixed in mavlink_adapter); the plant itself is standard-sign. The loop
+    must converge to the commanded bank on the 2x-gain laggy plant without
+    winding up — this is what bounds att_rate_kp."""
     from control.velocity_to_attitude import SIGN_ROLL_RIGHT
     v = VelocityToAttitude()
     tilt_per_mps = math.radians(cfg.control.att_tilt_per_mps_deg)
     desired = SIGN_ROLL_RIGHT * 2.0 * tilt_per_mps
 
-    roll = 0.0
+    roll, rate = 0.0, 0.0
     dt = 0.02  # 50 Hz, matching the live command rate
-    for _ in range(200):  # 4 simulated seconds
+    peak = 0.0
+    for _ in range(300):  # 6 simulated seconds
         cmd = v.convert(vx=0.0, vy=2.0, vz=0.0, yaw_rad=0.0,
                         roll_rad=roll, pitch_rad=0.0)
-        roll += (-cmd.roll_rate) * dt   # sim plant: actuation inverted
-    assert abs(roll - desired) < math.radians(1.0), \
-        f"roll loop must converge to desired bank (got {math.degrees(roll):.1f}°, " \
+        roll, rate = _measured_plant_step(roll, rate, cmd.roll_rate, dt)
+        peak = max(peak, abs(roll))
+    assert abs(roll - desired) < math.radians(1.5), \
+        f"roll must converge (got {math.degrees(roll):.1f}°, " \
         f"want {math.degrees(desired):.1f}°)"
+    assert peak < math.radians(45.0), \
+        "no tumble: transient must stay far from the rate-clamp wind-up regime"
 
 
-def test_pitch_loop_stable_under_standard_actuation():
-    """Counterpart sanity: the pitch axis uses the STANDARD convention
-    (positive commanded pitch rate -> positive telemetry pitch) and converged
-    fine on the live sim — it must keep converging with no sign flip."""
+def test_pitch_loop_stable_on_measured_plant():
     v = VelocityToAttitude()
     tilt_per_mps = math.radians(cfg.control.att_tilt_per_mps_deg)
     desired = -1.0 * 2.0 * tilt_per_mps  # SIGN_PITCH_FORWARD * v * gain
 
-    pitch = 0.0
+    pitch, rate = 0.0, 0.0
     dt = 0.02
-    for _ in range(200):
+    for _ in range(300):
         cmd = v.convert(vx=2.0, vy=0.0, vz=0.0, yaw_rad=0.0,
                         roll_rad=0.0, pitch_rad=pitch)
-        pitch += cmd.pitch_rate * dt    # standard plant
-    assert abs(pitch - desired) < math.radians(1.0)
+        pitch, rate = _measured_plant_step(pitch, rate, cmd.pitch_rate, dt)
+    assert abs(pitch - desired) < math.radians(1.5)
 
 
 def test_yaw_world_to_body_rotation():

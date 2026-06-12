@@ -47,14 +47,14 @@ SIGN_ROLL_RIGHT = +1.0      # rightward velocity -> positive roll (standard NED)
                             # the convention. Re-verify live now that the loop is stable.
 SIGN_YAW = +1.0             # positive yaw_rate request -> positive body yaw rate
 
-# Inner-loop feedback sign for the roll axis. fly17 (run_1781274821) proved the
-# sim's roll-rate actuation is INVERTED relative to its ATTITUDE roll telemetry
-# on this build: with identical gains the pitch loop converged while the roll
-# loop wound up into a rate-clamped continuous tumble (roll spinning through
-# ±180° all flight, confirmed in FPV frames; every mavlink flight to date
-# tumbled). rate = SIGN * kp * (desired - actual); SIGN must be -1 here so the
-# loop is negative feedback end-to-end. Pitch needs no such flip.
-SIGN_ROLL_RATE = -1.0
+# Inner-loop feedback sign for the roll axis. tools/attitude_sysid (2026-06-12,
+# open-loop) settled this: a +0.5 rad/s roll-rate pulse produced POSITIVE
+# ATTITUDE roll — the plant is STANDARD (+1). The fly17/18 tumble was the
+# inner loop closing on the ODOMETRY quaternion, whose euler decode is
+# (-roll, -pitch, +yaw) vs ATTITUDE on this build (fixed at the source in
+# mavlink_adapter._current_attitude_and_vz). Keep this hook at +1.0 unless a
+# future sim build measurably inverts the plant — re-run attitude_sysid first.
+SIGN_ROLL_RATE = +1.0
 
 
 @dataclass

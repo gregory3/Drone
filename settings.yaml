@@ -132,8 +132,15 @@ control:
   # velocity setpoints are ignored — must command body rates + thrust).
   mavlink_control_mode: "attitude"   # "attitude" (ACRO sim) | "velocity" (GUIDED sim)
   att_tilt_per_mps_deg: 4.5    # desired tilt angle per m/s of demanded body velocity (forward authority vs keeping gate in frame)
-  att_rate_kp: 5.0             # body-rate (rad/s) per rad of attitude error
-  att_max_rate_dps: 400.0      # body-rate command clamp
+  att_rate_kp: 2.0             # body-rate (rad/s) per rad of attitude error.
+                               # attitude_sysid measured the plant following rate
+                               # commands with ~2x gain AND momentum (rotation
+                               # continues ~10 deg after the command stops), so the
+                               # old 5.0 left no stability margin. Effective loop
+                               # gain ~4 with lag; raise carefully on the rig only.
+  att_max_rate_dps: 180.0      # body-rate command clamp. 400 let the loop slam the
+                               # drone through full flips; the 2x-gain laggy plant
+                               # turns big rate commands into uncontrolled tumbles.
   hover_thrust: 0.27           # collective thrust to hold altitude (measured ~0.26 on the AI-GP sim). Was 0.32 -> drone climbed the whole flight, gates fell below the 20deg-up camera, flew out of bounds -> DSQ. Takeoff lift comes from the climb term + takeoff phase, NOT from over-trimming hover.
   thrust_kp_climb: 0.12        # thrust per (m/s) of desired climb rate (enough to lift off)
   thrust_kd_climb: 0.08        # thrust damping per (m/s) of actual climb rate
