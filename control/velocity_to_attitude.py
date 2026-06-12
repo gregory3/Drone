@@ -40,12 +40,21 @@ from config.loader import cfg
 # Sign conventions — see module docstring. Flip these if the sim tune differs.
 SIGN_PITCH_FORWARD = -1.0   # forward velocity -> negative pitch (nose down)
                             # VERIFIED live 2026-06-03: forward cmd -> dN=+0.84m (correct).
-SIGN_ROLL_RIGHT = -1.0      # rightward velocity -> negative roll on THIS sim build.
-                            # VERIFIED live 2026-06-03 via tools/verify_attitude_signs:
-                            # the old +1.0 sent a "fly right" command 21m to the LEFT
-                            # (dE=-21.2m) — an inverted-roll runaway that threw the drone
-                            # off course on the first right-hand turn. Flipped to -1.0.
+SIGN_ROLL_RIGHT = +1.0      # rightward velocity -> positive roll (standard NED).
+                            # The 2026-06-03 "verified -1.0" displacement test is VOID:
+                            # it was run with an unstable roll loop (see SIGN_ROLL_RATE)
+                            # — the drone was tumbling, so net drift measured chaos, not
+                            # the convention. Re-verify live now that the loop is stable.
 SIGN_YAW = +1.0             # positive yaw_rate request -> positive body yaw rate
+
+# Inner-loop feedback sign for the roll axis. fly17 (run_1781274821) proved the
+# sim's roll-rate actuation is INVERTED relative to its ATTITUDE roll telemetry
+# on this build: with identical gains the pitch loop converged while the roll
+# loop wound up into a rate-clamped continuous tumble (roll spinning through
+# ±180° all flight, confirmed in FPV frames; every mavlink flight to date
+# tumbled). rate = SIGN * kp * (desired - actual); SIGN must be -1 here so the
+# loop is negative feedback end-to-end. Pitch needs no such flip.
+SIGN_ROLL_RATE = -1.0
 
 
 @dataclass
@@ -109,7 +118,7 @@ class VelocityToAttitude:
 
         # --- inner P loop: angle error -> body rate (ACRO consumes rates) ---
         pitch_rate = self._rate_kp * (desired_pitch - pitch_rad)
-        roll_rate = self._rate_kp * (desired_roll - roll_rad)
+        roll_rate = SIGN_ROLL_RATE * self._rate_kp * (desired_roll - roll_rad)
         pitch_rate = _clamp(pitch_rate, -self._max_rate, self._max_rate)
         roll_rate = _clamp(roll_rate, -self._max_rate, self._max_rate)
 

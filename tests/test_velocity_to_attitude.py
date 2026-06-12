@@ -24,20 +24,47 @@ def test_forward_velocity_pitches_nose_down():
     assert abs(cmd.roll_rate) < 1e-6
 
 
-def test_right_velocity_maps_to_configured_roll_sign():
-    # Rightward (east) velocity must roll in the direction the LIVE sim needs.
-    # SIGN_ROLL_RIGHT was verified against the real FlightSim build on
-    # 2026-06-03 (a "fly right" command moved the drone -21m east with the old
-    # +1.0 sign, i.e. inverted) and corrected to -1.0. The test checks the
-    # translator applies that verified sign rather than a hardcoded assumption.
+def test_roll_loop_stable_under_inverted_sim_actuation():
+    """fly17 regression (run_1781274821): this sim build's roll-rate actuation
+    is INVERTED relative to its ATTITUDE roll telemetry (positive commanded
+    roll rate drives the telemetry roll angle NEGATIVE). With the naive
+    rate = kp*(desired - actual) the loop is positive feedback: the drone
+    wound up into a rate-clamped continuous tumble on every mavlink flight.
+
+    Simulate that plant convention closed-loop: a steady rightward velocity
+    command must CONVERGE to a steady bank (and to the SIGN_ROLL_RIGHT-signed
+    desired angle), not wind up."""
     from control.velocity_to_attitude import SIGN_ROLL_RIGHT
     v = VelocityToAttitude()
-    cmd = v.convert(vx=0.0, vy=2.0, vz=0.0, yaw_rad=0.0,
-                    roll_rad=0.0, pitch_rad=0.0)
-    assert cmd.roll_rate != 0.0
-    assert (cmd.roll_rate > 0) == (SIGN_ROLL_RIGHT > 0), \
-        "roll command must follow the verified SIGN_ROLL_RIGHT convention"
-    assert abs(cmd.pitch_rate) < 1e-6
+    tilt_per_mps = math.radians(cfg.control.att_tilt_per_mps_deg)
+    desired = SIGN_ROLL_RIGHT * 2.0 * tilt_per_mps
+
+    roll = 0.0
+    dt = 0.02  # 50 Hz, matching the live command rate
+    for _ in range(200):  # 4 simulated seconds
+        cmd = v.convert(vx=0.0, vy=2.0, vz=0.0, yaw_rad=0.0,
+                        roll_rad=roll, pitch_rad=0.0)
+        roll += (-cmd.roll_rate) * dt   # sim plant: actuation inverted
+    assert abs(roll - desired) < math.radians(1.0), \
+        f"roll loop must converge to desired bank (got {math.degrees(roll):.1f}°, " \
+        f"want {math.degrees(desired):.1f}°)"
+
+
+def test_pitch_loop_stable_under_standard_actuation():
+    """Counterpart sanity: the pitch axis uses the STANDARD convention
+    (positive commanded pitch rate -> positive telemetry pitch) and converged
+    fine on the live sim — it must keep converging with no sign flip."""
+    v = VelocityToAttitude()
+    tilt_per_mps = math.radians(cfg.control.att_tilt_per_mps_deg)
+    desired = -1.0 * 2.0 * tilt_per_mps  # SIGN_PITCH_FORWARD * v * gain
+
+    pitch = 0.0
+    dt = 0.02
+    for _ in range(200):
+        cmd = v.convert(vx=2.0, vy=0.0, vz=0.0, yaw_rad=0.0,
+                        roll_rad=0.0, pitch_rad=pitch)
+        pitch += cmd.pitch_rate * dt    # standard plant
+    assert abs(pitch - desired) < math.radians(1.0)
 
 
 def test_yaw_world_to_body_rotation():
