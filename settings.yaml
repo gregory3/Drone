@@ -69,9 +69,14 @@ perception:
   # First-pass red values — sample a real frame on the rig to nail them.
   gate_hsv_lower: [15, 80, 80]
   gate_hsv_upper: [40, 255, 255]
-  gate_hsv_lower2: [0, 110, 70]      # red, low-hue side
+  # Saturation floor 50 (was 110) + high-hue wrap from 160 (was 170): the sim's
+  # gate-highlight pulse desaturates the red toward pink (measured S~98, some
+  # pixels at H 140-169 in fly15 f00600), which dropped the mask below min-area
+  # every ~15s ON A STATIC SCENE. Offline sweep over 374 fly15 pad frames:
+  # gate blob available 80.5% -> 94.1% with these ranges.
+  gate_hsv_lower2: [0, 50, 70]       # red, low-hue side
   gate_hsv_upper2: [10, 255, 255]
-  gate_hsv_lower3: [170, 110, 70]    # red, high-hue side (wrap)
+  gate_hsv_lower3: [160, 50, 70]     # red/pink, high-hue side (wrap)
   gate_hsv_upper3: [179, 255, 255]
 
   # Round 2 / neural detector (YOLO-family, swapped in via config)

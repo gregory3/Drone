@@ -130,6 +130,7 @@ class AutonomyLoop:
         self._dump_dt = 1.0 / dump_hz if dump_hz > 0 else 0.2
         self._last_dump_t = 0.0
         self._frames_dir: Optional[Path] = None
+        self._frames_raw_dir: Optional[Path] = None
         self._dump_idx = 0
 
         # Camera-dead watchdog: abort if frames stay black (sim camera died).
@@ -162,6 +163,11 @@ class AutonomyLoop:
         if self._dump_frames:
             self._frames_dir = Path(cfg.telemetry.log_dir) / self._logger.run_id / "frames"
             self._frames_dir.mkdir(parents=True, exist_ok=True)
+            # Raw (unannotated) copies form the offline perception-regression
+            # corpus: the HUD overlay pollutes HSV re-runs (green text/boxes
+            # trip the green-twin start-light rejection).
+            self._frames_raw_dir = Path(cfg.telemetry.log_dir) / self._logger.run_id / "frames_raw"
+            self._frames_raw_dir.mkdir(parents=True, exist_ok=True)
             print(f"[Main] Dumping annotated frames → {self._frames_dir}")
 
         try:
@@ -453,6 +459,9 @@ class AutonomyLoop:
                         0.5, (0, 255, 0), 1, cv2.LINE_AA)
         out = self._frames_dir / f"f{self._dump_idx:05d}.jpg"
         cv2.imwrite(str(out), frame)
+        if self._frames_raw_dir is not None:
+            cv2.imwrite(str(self._frames_raw_dir / f"f{self._dump_idx:05d}.jpg"),
+                        image)
         self._dump_idx += 1
 
     # ------------------------------------------------------------------
